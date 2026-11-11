@@ -1,0 +1,20 @@
+# Local research artifacts - never commit.
+# Firmware APKs, device dumps, screenshots, theme fixtures and work logs stay local.
+.workbuddy/
+config/
+fixtures/
+logs/
+reference/
+screenshots/
+scripts/
+*.apk
+*.pack
+*.pb
+
+# Gradle / IDE
+gboard-9key-tweak/.gradle/
+gboard-9key-tweak/build/
+gboard-9key-tweak/app/build/
+gboard-9key-tweak/local.properties
+*.iml
+.idea/

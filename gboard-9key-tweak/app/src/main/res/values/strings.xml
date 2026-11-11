@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Gboard 9键调整</string>
+    <string name="module_desc">Gboard 九宫格右侧键位调整：大写与四向箭头换位，换行键吞并一格</string>
+</resources>

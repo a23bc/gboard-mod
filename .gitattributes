@@ -1,0 +1,4 @@
+# LSPosed reads these line-by-line. A trailing CR would corrupt the entry class
+# name and the properties keys on Windows checkouts.
+gboard-9key-tweak/app/src/main/resources/META-INF/xposed/*.list text eol=lf
+gboard-9key-tweak/app/src/main/resources/META-INF/xposed/*.prop text eol=lf
