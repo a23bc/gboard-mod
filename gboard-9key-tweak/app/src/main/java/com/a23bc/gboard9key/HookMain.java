@@ -154,10 +154,9 @@ public final class HookMain extends XposedModule {
             return;
         }
         try {
-            // Reuse keyA's layout params so enter gets the exact same slot
-            // (width / height / weight) in the right column.
-            ViewGroup.LayoutParams lp =
-                    rightCol.generateLayoutParams(keyA.getLayoutParams());
+            // keyA already belongs to rightCol, so its LayoutParams instance is
+            // a valid one for addView() (generateLayoutParams is protected).
+            ViewGroup.LayoutParams lp = keyA.getLayoutParams();
             rightCol.removeView(keyA);       // real delete -> shift slides up
             bottomRow.removeView(enter);     // leave the bottom row
             rightCol.addView(enter, lp);     // the merged key
