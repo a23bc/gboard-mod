@@ -16,35 +16,28 @@ import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
 /**
- * v0.1 - View-tree probe + (disabled) right-column tweak for Gboard Chinese 9-key.
- * Uses the modern libxposed API (compiled against 102.0.0, module.prop declares 101).
+ * Gboard Chinese 9-key right-column tweak, modern libxposed API (102).
  *
- * Anchor: InputMethodService.setInputView(View). It is the only reliable framework
- * anchor on Gboard - Gboard overrides onCreateInputView/onStartInputView WITHOUT
- * calling super, so hooks on those never fire (see BetterZUIKey-GboardExt/PRINCIPLE.md,
- * verified on Gboard 17.2.2 / 18.1.3 / 18.3.1). setInputView is not overridden.
+ * Anchor: InputMethodService.setInputView(View) - the only reliable framework
+ * anchor on Gboard (onCreateInputView/onStartInputView are overridden without
+ * calling super, so hooks on them never fire; verified on 17.2.2/18.1.3/18.3.1).
  *
- * No obfuscated class names are referenced. Keys are located by geometry
- * (right-most column sorted by y), so an R8 renames-everything update does not
- * break the module.
+ * Keys are found by geometry + clickability, never by obfuscated class names.
+ * Measured on PJZ110 / Gboard 18.6.3:
+ *   keyboard starts at y=2100, right column x=1219..1440,
+ *   9-key rows are 202px tall, letter keys carry id key_pos_9key_1..9.
  *
- * Desired right column, top to bottom (PJZ110 / Gboard 18.6.3 screenshot):
- *   delete | 4-way arrow ("keyA") | shift(caps, with "123") | enter
- * Result:
- *   delete | shift | enter (two rows tall, swallowing keyA's slot)
+ * Right column (top to bottom): delete | 4-way arrow ("keyA") | shift | enter.
+ * Desired: shift <-> keyA swap, hide keyA, grow enter upward by one row.
  */
 public final class HookMain extends XposedModule {
 
     private static final String TAG = "G9K";
     private static final String TARGET = "com.google.android.inputmethod.latin";
 
-    /** v0.1: log the keyboard View tree only. */
     private static final boolean DUMP_TREE = true;
-    /** Flip to true ONLY after the dump confirms 4 sibling key Views in the right column. */
-    private static final boolean APPLY_TWEAK = false;
+    private static final boolean APPLY_TWEAK = true;
 
-    // The 9-key keys sit ~16 levels deep under InputView; 12 truncated the dump
-    // at the left symbol column (measured on Gboard 18.6.3 / PJZ110).
     private static final int MAX_NODES = 1500;
     private static final int MAX_DEPTH = 24;
     private static final long DUMP_INTERVAL_MS = 1500L;
@@ -60,7 +53,6 @@ public final class HookMain extends XposedModule {
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
         final String pkg = param.getPackageName();
         try {
-            // Tells us whether the installed LSPosed actually serves API 101 or 102.
             Log.i(TAG, "framework=" + getFrameworkName()
                     + " version=" + getFrameworkVersion()
                     + " api=" + getApiVersion()
@@ -139,13 +131,20 @@ public final class HookMain extends XposedModule {
     }
 
     /**
-     * Swap the 2nd/3rd right-column keys, hide the (now lower) keyA, then grow
-     * the enter key upward by one row so it swallows that slot.
+     * The header toolbar also has a clickable key on the right (voice input),
+     * so the right column is the LAST FOUR clickable keys sorted by y.
      */
     private static void applyTweak(List<KeyView> column) {
-        View keyA = column.get(1).view;
-        View shift = column.get(2).view;
-        View enter = column.get(3).view;
+        int n = column.size();
+        View delete = column.get(n - 4).view;
+        View keyA = column.get(n - 3).view;   // 4-way arrow
+        View shift = column.get(n - 2).view;  // caps / shift
+        View enter = column.get(n - 1).view;  // enter / newline
+
+        Log.i(TAG, "targets: delete=" + column.get(n - 4).describe()
+                + " keyA=" + column.get(n - 3).describe()
+                + " shift=" + column.get(n - 2).describe()
+                + " enter=" + column.get(n - 1).describe());
 
         int topA = keyA.getTop();
         int topShift = shift.getTop();
@@ -154,16 +153,16 @@ public final class HookMain extends XposedModule {
             row = enter.getHeight();
         }
 
-        // 1) swap positions using translation, which does not disturb the parent's layout.
+        // 1) swap via translation; does not disturb the parent's layout pass.
         keyA.setTranslationY(topShift - topA);
         shift.setTranslationY(topA - topShift);
 
-        // 2) keyA disappears but keeps its slot so the parent does not reflow.
+        // 2) keyA disappears but keeps its slot, so the parent does not reflow.
         keyA.setAlpha(0f);
         keyA.setClickable(false);
         keyA.setEnabled(false);
 
-        // 3) enter grows upward by one row. Prefer real LayoutParams; fall back to scaleY.
+        // 3) enter grows upward by one row. Prefer LayoutParams, else scaleY.
         int oldHeight = enter.getHeight();
         ViewGroup.LayoutParams lp = enter.getLayoutParams();
         boolean resized = false;
@@ -175,10 +174,12 @@ public final class HookMain extends XposedModule {
             enter.setScaleY((float) (oldHeight + row) / oldHeight);
         }
         enter.setTranslationY(-row / 2f);
+        enter.bringToFront();
 
         Log.i(TAG, "tweak applied: row=" + row
                 + " enter " + oldHeight + " -> " + (oldHeight + row)
                 + " layoutParams=" + resized
+                + " delete=" + delete.getClass().getSimpleName()
                 + " parent=" + enter.getParent().getClass().getName());
     }
 
@@ -192,13 +193,14 @@ public final class HookMain extends XposedModule {
 
         List<KeyView> column = new ArrayList<>();
         for (KeyView k : all) {
+            // Only real keys are clickable; containers are not.
+            if (!k.clickable || k.visibility != View.VISIBLE) {
+                continue;
+            }
             if (k.centerX < thresholdX) {
                 continue;
             }
             if (k.width < rootWidth * 0.08 || k.height < 20) {
-                continue;
-            }
-            if (k.visibility != View.VISIBLE) {
                 continue;
             }
             column.add(k);
@@ -208,7 +210,7 @@ public final class HookMain extends XposedModule {
     }
 
     private static void collect(View v, List<KeyView> out) {
-        if (out.size() >= MAX_NODES) {
+        if (out.size() >= MAX_NODES || v.getVisibility() == View.GONE) {
             return;
         }
         out.add(new KeyView(v));
@@ -220,60 +222,63 @@ public final class HookMain extends XposedModule {
         }
     }
 
+    /** Log only clickable keys, batched: ~30 lines instead of ~1500. */
     private static void dumpTree(View root) {
         Log.i(TAG, "========== KEYBOARD VIEW TREE ==========");
         Log.i(TAG, "root=" + root.getClass().getName()
                 + " " + root.getWidth() + "x" + root.getHeight());
-        walk(root, 0, new int[1]);
-        Log.i(TAG, "========== END VIEW TREE ==========");
-        Log.i(TAG, "run: adb logcat -s G9K");
+        List<String> lines = new ArrayList<>();
+        walk(root, 0, new int[1], lines);
+        StringBuilder sb = new StringBuilder();
+        int n = 0;
+        for (String l : lines) {
+            sb.append(l).append('\n');
+            if (++n % 12 == 0) {
+                Log.i(TAG, sb.toString());
+                sb.setLength(0);
+            }
+        }
+        if (sb.length() > 0) {
+            Log.i(TAG, sb.toString());
+        }
+        Log.i(TAG, "========== END VIEW TREE (" + lines.size() + " keys) ==========");
     }
 
-    private static void walk(View v, int depth, int[] counter) {
+    private static void walk(View v, int depth, int[] counter, List<String> out) {
         if (depth > MAX_DEPTH || counter[0] >= MAX_NODES) {
             return;
         }
         counter[0]++;
-        int[] loc = new int[2];
-        v.getLocationInWindow(loc);
-        String id = "";
-        try {
-            if (v.getId() != View.NO_ID) {
-                id = v.getResources().getResourceEntryName(v.getId());
-            }
-        } catch (Throwable ignored) {
-            id = "0x" + Integer.toHexString(v.getId());
-        }
-        String desc = v.getContentDescription() == null
-                ? "" : v.getContentDescription().toString().replace('\n', ' ');
-        String text = v instanceof TextView
-                ? String.valueOf(((TextView) v).getText()).replace('\n', ' ') : "";
-        int children = v instanceof ViewGroup ? ((ViewGroup) v).getChildCount() : -1;
-        Log.i(TAG, String.format(
-                "%s%s id=%s vis=%d click=%d [%d,%d %dx%d] desc=%s text=%s children=%d",
-                indent(depth), v.getClass().getName(), id,
-                v.getVisibility(), v.isClickable() ? 1 : 0,
-                loc[0], loc[1], v.getWidth(), v.getHeight(),
-                desc, text, children));
-        // A GONE subtree never renders; skipping it keeps the dump focused and
-        // leaves logcat buffer room for the actual 9-key rows.
         if (v.getVisibility() == View.GONE) {
             return;
+        }
+        if (v.getVisibility() == View.VISIBLE && v.isClickable()
+                && v.getWidth() > 0 && v.getHeight() > 0) {
+            int[] loc = new int[2];
+            v.getLocationInWindow(loc);
+            String id = "";
+            try {
+                if (v.getId() != View.NO_ID) {
+                    id = v.getResources().getResourceEntryName(v.getId());
+                }
+            } catch (Throwable ignored) {
+                id = "0x" + Integer.toHexString(v.getId());
+            }
+            String desc = v.getContentDescription() == null
+                    ? "" : v.getContentDescription().toString().replace('\n', ' ');
+            String text = v instanceof TextView
+                    ? String.valueOf(((TextView) v).getText()).replace('\n', ' ') : "";
+            out.add(v.getClass().getSimpleName() + " id=" + id
+                    + " [" + loc[0] + "," + loc[1] + " "
+                    + v.getWidth() + "x" + v.getHeight() + "]"
+                    + " desc=" + desc + " text=" + text);
         }
         if (v instanceof ViewGroup) {
             ViewGroup g = (ViewGroup) v;
             for (int i = 0; i < g.getChildCount(); i++) {
-                walk(g.getChildAt(i), depth + 1, counter);
+                walk(g.getChildAt(i), depth + 1, counter, out);
             }
         }
-    }
-
-    private static String indent(int depth) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < depth; i++) {
-            sb.append("  ");
-        }
-        return sb.toString();
     }
 
     private static final class KeyView {
@@ -284,6 +289,8 @@ public final class HookMain extends XposedModule {
         final int height;
         final int centerX;
         final int visibility;
+        final boolean clickable;
+        final String desc;
 
         KeyView(View v) {
             this.view = v;
@@ -295,11 +302,15 @@ public final class HookMain extends XposedModule {
             this.height = v.getHeight();
             this.centerX = left + width / 2;
             this.visibility = v.getVisibility();
+            this.clickable = v.isClickable();
+            this.desc = v.getContentDescription() == null
+                    ? "" : v.getContentDescription().toString();
         }
 
         String describe() {
             return view.getClass().getSimpleName()
-                    + " [" + left + "," + top + " " + width + "x" + height + "]";
+                    + " [" + left + "," + top + " " + width + "x" + height + "]"
+                    + " desc=" + desc;
         }
     }
 }
