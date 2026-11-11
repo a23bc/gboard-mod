@@ -133,51 +133,42 @@ public final class HookMain extends XposedModule {
         applyTweak(keyA, shift, enter);
     }
 
+    /**
+     * REAL merge: keyA is removed from the right column (so shift naturally
+     * moves up into its slot), and the enter key is reparented from the bottom
+     * row into the right column. One key ends up where two used to be.
+     *
+     * The two keys live in SIBLING containers - right column is child #3 of
+     * input_area (3 vertical rows), enter is in the bottom row container.
+     * That is why changing height/translation could never work: it triggers a
+     * cross-container relayout. Reparenting avoids touching any layout size.
+     */
     private static void applyTweak(View keyA, View shift, View enter) {
-        int[] a = location(keyA);
-        int[] s = location(shift);
-        int[] e = location(enter);
-        int row = Math.abs(s[1] - a[1]);   // window coords, NOT getTop()
-        if (row < 8) {
-            row = enter.getHeight();
+        ViewGroup rightCol = keyA.getParent() instanceof ViewGroup
+                ? (ViewGroup) keyA.getParent() : null;
+        ViewGroup bottomRow = enter.getParent() instanceof ViewGroup
+                ? (ViewGroup) enter.getParent() : null;
+        if (rightCol == null || bottomRow == null || rightCol == bottomRow) {
+            Log.w(TAG, "unexpected parents: rightCol=" + rightCol
+                    + " bottomRow=" + bottomRow);
+            return;
         }
-        int h = enter.getHeight();
-        Log.i(TAG, "targets: keyA.y=" + a[1] + " shift.y=" + s[1]
-                + " enter.y=" + e[1] + " h=" + h + " row=" + row);
-
-        // 1) shift takes keyA's slot; keyA moves down and disappears.
-        shift.setTranslationY(-row);
-        keyA.setTranslationY(row);
-        keyA.setAlpha(0f);
-        keyA.setClickable(false);
-        keyA.setEnabled(false);
-
-        // 2) enter grows upward by one row; its bottom edge stays where it was.
-        //    Prefer a concrete LayoutParams height over scaleY so the glyph
-        //    inside the key is not stretched.
-        ViewGroup.LayoutParams lp = enter.getLayoutParams();
-        boolean resized = false;
-        if (lp != null && h > 0) {
-            lp.height = h + row;
-            enter.setLayoutParams(lp);
-            enter.setTranslationY(-row);
-            resized = true;
-        } else if (h > 0) {
-            enter.setPivotY(h);
-            enter.setScaleY((float) (h + row) / h);
+        try {
+            // Reuse keyA's layout params so enter gets the exact same slot
+            // (width / height / weight) in the right column.
+            ViewGroup.LayoutParams lp =
+                    rightCol.generateLayoutParams(keyA.getLayoutParams());
+            rightCol.removeView(keyA);       // real delete -> shift slides up
+            bottomRow.removeView(enter);     // leave the bottom row
+            rightCol.addView(enter, lp);     // the merged key
+            Log.i(TAG, "merged: keyA removed; enter reparented"
+                    + " rightCol=" + rightCol.getClass().getSimpleName()
+                    + " children=" + rightCol.getChildCount()
+                    + " bottomRow children=" + bottomRow.getChildCount()
+                    + " shift=" + shift.getClass().getSimpleName());
+        } catch (Throwable t) {
+            Log.w(TAG, "merge failed", t);
         }
-        enter.bringToFront();
-
-        Log.i(TAG, "tweak applied: enter " + h + " -> " + (h + row)
-                + " layoutParams=" + resized
-                + " shiftY=" + shift.getTranslationY()
-                + " parent=" + enter.getParent().getClass().getName());
-    }
-
-    private static int[] location(View v) {
-        int[] loc = new int[2];
-        v.getLocationInWindow(loc);
-        return loc;
     }
 
     /** Resource entry names are plain text even when class names are R8-mangled. */
