@@ -1,9 +1,8 @@
 # libxposed module config (Java properties format).
-# Compiled against io.github.libxposed:api:102.0.0 (latest published).
-# Framework API level is declared 101 on purpose: BetterZUIKey-GboardExt v1.1.1
-# (2026-11-06, verified on Gboard 18.3.1) still declares 101, and no device-side
-# evidence was found that shipping LSPosed builds support API 102 yet.
-# If your LSPosed reports API 102, change both numbers below to 102.
-minApiVersion=101
-targetApiVersion=101
+# Compiled against io.github.libxposed:api:102.0.0.
+# Device-measured on PJZ110 (2026-11-12): HookMain logged
+#   framework=LSPosed version=2.2.1 api=102
+# so API 102 is declared here.
+minApiVersion=102
+targetApiVersion=102
 staticScope=true

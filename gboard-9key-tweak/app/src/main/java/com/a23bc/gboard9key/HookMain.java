@@ -43,8 +43,10 @@ public final class HookMain extends XposedModule {
     /** Flip to true ONLY after the dump confirms 4 sibling key Views in the right column. */
     private static final boolean APPLY_TWEAK = false;
 
-    private static final int MAX_NODES = 400;
-    private static final int MAX_DEPTH = 12;
+    // The 9-key keys sit ~16 levels deep under InputView; 12 truncated the dump
+    // at the left symbol column (measured on Gboard 18.6.3 / PJZ110).
+    private static final int MAX_NODES = 1500;
+    private static final int MAX_DEPTH = 24;
     private static final long DUMP_INTERVAL_MS = 1500L;
 
     private static long lastDumpMs = 0L;
@@ -253,6 +255,11 @@ public final class HookMain extends XposedModule {
                 v.getVisibility(), v.isClickable() ? 1 : 0,
                 loc[0], loc[1], v.getWidth(), v.getHeight(),
                 desc, text, children));
+        // A GONE subtree never renders; skipping it keeps the dump focused and
+        // leaves logcat buffer room for the actual 9-key rows.
+        if (v.getVisibility() == View.GONE) {
+            return;
+        }
         if (v instanceof ViewGroup) {
             ViewGroup g = (ViewGroup) v;
             for (int i = 0; i < g.getChildCount(); i++) {
