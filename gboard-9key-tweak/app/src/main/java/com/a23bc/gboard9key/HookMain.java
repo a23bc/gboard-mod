@@ -6,6 +6,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.util.Log;
@@ -312,22 +313,43 @@ public final class HookMain extends XposedModule {
         GradientDrawable gd = new GradientDrawable();
         gd.setColor(color);
         gd.setCornerRadius(26f);
-        final View iconView = findIconView(enter);
+        List<Drawable> cands = new ArrayList<>();
+        collectIcons(enter, cands);
+        Drawable chosen = null;
+        for (Drawable d : cands) {
+            Log.i(TAG, "icon candidate " + d.getClass().getSimpleName()
+                    + " " + d.getIntrinsicWidth() + "x" + d.getIntrinsicHeight());
+            // GradientDrawable/ColorDrawable report -1; real glyphs are
+            // VectorDrawable/BitmapDrawable with a positive intrinsic size.
+            if (chosen == null && d.getIntrinsicWidth() > 0
+                    && d.getIntrinsicHeight() > 0) {
+                chosen = d;
+            }
+        }
+        Drawable tmp = chosen;
+        if (chosen != null && chosen.getConstantState() != null) {
+            try {
+                tmp = chosen.getConstantState().newDrawable().mutate();
+            } catch (Throwable ignored) {
+                tmp = chosen;
+            }
+        }
+        final Drawable nativeIcon = tmp;
 
         View key = new View(c) {
             @Override
             protected void onDraw(Canvas canvas) {
                 super.onDraw(canvas);
-                if (iconView != null && iconView.getWidth() > 0
-                        && iconView.getHeight() > 0) {
-                    int iw = iconView.getWidth();
-                    int ih = iconView.getHeight();
-                    int l = (getWidth() - iw) / 2;
-                    int t = (getHeight() - ih) / 2;
-                    canvas.save();
-                    canvas.translate(l, t);
-                    iconView.draw(canvas);   // Gboard paints its own glyph
-                    canvas.restore();
+                if (nativeIcon != null) {
+                    int iw = nativeIcon.getIntrinsicWidth();
+                    int ih = nativeIcon.getIntrinsicHeight();
+                    float s = 96f / Math.max(iw, ih);
+                    int dw = Math.round(iw * s);
+                    int dh = Math.round(ih * s);
+                    int l = (getWidth() - dw) / 2;
+                    int t = (getHeight() - dh) / 2;
+                    nativeIcon.setBounds(l, t, l + dw, t + dh);
+                    nativeIcon.draw(canvas);
                 } else {
                     Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
                     p.setColor(Color.WHITE);
@@ -342,28 +364,32 @@ public final class HookMain extends XposedModule {
         key.setWillNotDraw(false);
         Log.i(TAG, "big key " + w + "x" + h
                 + " color=0x" + Integer.toHexString(color)
-                + " iconView=" + (iconView == null ? "null"
-                    : iconView.getClass().getSimpleName() + " "
-                    + iconView.getWidth() + "x" + iconView.getHeight()));
+                + " iconCandidates=" + cands.size()
+                + " chosen=" + (nativeIcon == null ? "null"
+                    : nativeIcon.getClass().getSimpleName()));
         return key;
     }
 
-    /** Find Gboard's own visible icon View (often NonLinearScaleImageView). */
-    private static View findIconView(View v) {
-        if (v instanceof ImageView && v.getVisibility() == View.VISIBLE
-                && v.getWidth() > 0 && v.getHeight() > 0) {
-            return v;
+    private static void collectIcons(View v, List<Drawable> out) {
+        if (v instanceof ImageView) {
+            Drawable d = ((ImageView) v).getDrawable();
+            if (d != null) {
+                out.add(d);
+            }
+        }
+        if (v instanceof TextView) {
+            for (Drawable d : ((TextView) v).getCompoundDrawables()) {
+                if (d != null) {
+                    out.add(d);
+                }
+            }
         }
         if (v instanceof ViewGroup) {
             ViewGroup g = (ViewGroup) v;
             for (int i = 0; i < g.getChildCount(); i++) {
-                View r = findIconView(g.getChildAt(i));
-                if (r != null) {
-                    return r;
-                }
+                collectIcons(g.getChildAt(i), out);
             }
         }
-        return null;
     }
 
     /** Fallback only when pixel sampling fails. */
