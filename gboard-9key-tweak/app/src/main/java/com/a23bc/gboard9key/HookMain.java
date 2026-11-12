@@ -28,21 +28,20 @@ import io.github.libxposed.api.XposedModuleInterface;
 
 /**
  * Gboard Chinese 9-key: ONE tall enter key occupying both bottom-right slots.
+ * ONLY while the Chinese 9-key layout is on screen.
  *
- * How Gboard itself colours keys (from assets/theme in base.apk):
- *   style_sheet_dynamic_color_{dark,light,rules}.binarypb use color_gm3_* tokens
- *   (color_gm3_surface_container_*, default_bordered_key_color ...), resolved at
- *   runtime by DynamicColorThemeSpecProvider.parseDynamicColorSpec().
- * Reproducing that token map is version/contrast dependent, so instead we
- * SAMPLE the actual rendered pixel of a real key - whatever Gboard resolved is
- * exactly what we paint. Re-sampled on every keyboard build, so it follows
- * system dynamic-colour changes automatically.
+ * A state machine driven by OnPreDrawListener is essential: switching to
+ * QWERTY / symbol / number keyboards reuses the same InputView, so a one-shot
+ * setInputView hook leaves the merged key (and its touch rect) behind - the
+ * "giant enter key on other keyboards" bug.
  *
- * The native enter glyph is drawn by calling draw() on Gboard's own icon View
- * (finding a Drawable returned a GradientDrawable -1x-1, i.e. not the glyph).
- *
- * Layout: keyA removed for real; merged rect aligned to the RIGHT COLUMN;
- * touches handled by hooking dispatchTouchEvent on the InputView class chain.
+ * Colour: Gboard resolves color_gm3_* tokens in style_sheet_dynamic_color_*.
+ * We SAMPLE the rendered pixel of a real key, so it follows dynamic colour.
+ * Glyph: the real VectorDrawable is picked out of the original enter subtree
+ * (the first candidate is a GradientDrawable -1x-1, not the glyph).
+ * Alignment: geometry from the right column, not the bottom row.
+ * Touch: hook dispatchTouchEvent on the InputView class chain, hit-test in
+ * screen coords, forward a complete MotionEvent copy to the original enter.
  */
 public final class HookMain extends XposedModule {
 
@@ -52,22 +51,28 @@ public final class HookMain extends XposedModule {
     private static final String ID_KEY_A = "key_pos_move_cursor";
     private static final String ID_SHIFT = "key_pos_shift";
     private static final String ID_ENTER = "key_pos_ime_action";
+    private static final String ID_9KEY_1 = "key_pos_9key_1";
 
     private static final boolean DUMP_TREE = true;
-    private static final boolean APPLY_TWEAK = true;
-
     private static final int MAX_NODES = 1500;
     private static final int MAX_DEPTH = 24;
     private static final long DUMP_INTERVAL_MS = 1500L;
 
     private static long lastDumpMs = 0L;
-    private static final WeakHashMap<View, Boolean> APPLIED = new WeakHashMap<>();
 
     private static volatile View sRoot;
     private static volatile View sEnter;
-    private static volatile Rect sHit;      // screen coordinates
+    private static volatile Rect sHit;          // screen coordinates
     private static volatile boolean sDispatchHooked = false;
     private static volatile boolean sForwarding = false;
+
+    // State machine: applied only while a 9-key layout is visible.
+    private static volatile boolean sApplied = false;
+    private static volatile View sWatchedRoot;
+    private static volatile View sBigKey;
+    private static volatile View sHiddenEnter;
+    private static volatile View sHiddenKeyA;
+    private static volatile ViewGroup sOverlayRoot;
 
     public HookMain() {
         super();
@@ -123,36 +128,80 @@ public final class HookMain extends XposedModule {
 
     private void onKeyboardView(View root) {
         if (!(root instanceof ViewGroup) || root.getWidth() <= 0 || root.getHeight() <= 0) {
-            Log.w(TAG, "root not laid out: " + root.getWidth() + "x" + root.getHeight());
             return;
         }
+        sRoot = root;
         long now = System.currentTimeMillis();
         if (DUMP_TREE && now - lastDumpMs > DUMP_INTERVAL_MS) {
             lastDumpMs = now;
             dumpTree(root);
         }
-        if (!APPLY_TWEAK) {
+        installDispatchHook(root);
+        installPreDrawWatcher(root);
+        evaluate(root);
+    }
+
+    /** Layout switches re-draw the same InputView; re-evaluate every frame. */
+    private void installPreDrawWatcher(View root) {
+        if (sWatchedRoot == root) {
+            return;
+        }
+        sWatchedRoot = root;
+        root.getViewTreeObserver().addOnPreDrawListener(() -> {
+            try {
+                evaluate(root);
+            } catch (Throwable t) {
+                Log.w(TAG, "predraw evaluate failed", t);
+            }
+            return true;
+        });
+        Log.i(TAG, "predraw watcher installed");
+    }
+
+    private static void evaluate(View root) {
+        boolean is9Key = findKeyById(root, ID_9KEY_1) != null
+                && findKeyById(root, ID_ENTER) != null;
+        if (is9Key == sApplied) {
+            return;
+        }
+        if (!is9Key) {
+            cleanup();
+            Log.i(TAG, "left 9-key layout: merged key removed, enter restored");
             return;
         }
         View keyA = findKeyById(root, ID_KEY_A);
         View shift = findKeyById(root, ID_SHIFT);
         View enter = findKeyById(root, ID_ENTER);
         if (keyA == null || shift == null || enter == null) {
-            Log.w(TAG, "id lookup failed");
             return;
         }
-        synchronized (APPLIED) {
-            if (APPLIED.containsKey(enter)) {
-                return;
-            }
-            APPLIED.put(enter, Boolean.TRUE);
-        }
-        installDispatchHook(root);
         applyTweak(root, keyA, shift, enter);
     }
 
+    private static void cleanup() {
+        if (sOverlayRoot != null && sBigKey != null) {
+            try {
+                sOverlayRoot.getOverlay().remove(sBigKey);
+            } catch (Throwable ignored) {
+                // root already detached
+            }
+        }
+        if (sHiddenEnter != null) {
+            sHiddenEnter.setAlpha(1f);
+        }
+        if (sHiddenKeyA != null) {
+            sHiddenKeyA.setVisibility(View.VISIBLE);
+        }
+        sBigKey = null;
+        sHiddenEnter = null;
+        sHiddenKeyA = null;
+        sOverlayRoot = null;
+        sEnter = null;
+        sHit = null;
+        sApplied = false;
+    }
+
     private void installDispatchHook(View root) {
-        sRoot = root;
         if (sDispatchHooked) {
             return;
         }
@@ -164,9 +213,9 @@ public final class HookMain extends XposedModule {
                 m.setAccessible(true);
                 hook(m).intercept(chain -> {
                     try {
-                        Object self = chain.getThisObject();
                         Object a0 = chain.getArg(0);
-                        if (self != sRoot || !(a0 instanceof MotionEvent)) {
+                        if (!sApplied || chain.getThisObject() != sRoot
+                                || !(a0 instanceof MotionEvent)) {
                             return chain.proceed();
                         }
                         MotionEvent ev = (MotionEvent) a0;
@@ -229,17 +278,14 @@ public final class HookMain extends XposedModule {
         ViewGroup rightCol = keyA.getParent() instanceof ViewGroup
                 ? (ViewGroup) keyA.getParent() : null;
         if (rightCol == null) {
-            Log.w(TAG, "keyA has no ViewGroup parent");
             return;
         }
         int row = shift.getHeight();
         int origH = enter.getHeight();
-        int[] e = location(enter);       // screen
+        int[] e = location(enter);
         int[] r = location(root);
         int[] rc = location(rightCol);
 
-        // Sample BEFORE touching the tree: the real key colour as Gboard
-        // actually rendered it (dynamic colour / theme / contrast proof).
         int sampled = sampleKeyColor(root, shift);
         int color = sampled != 0 ? sampled : keyColor(root.getContext());
 
@@ -248,20 +294,26 @@ public final class HookMain extends XposedModule {
         int w = rightCol.getWidth();
         int h = row + origH;
 
-        rightCol.removeView(keyA);
+        // GONE (reversible) instead of removeView: LinearLayout still slides
+        // shift up, and cleanup() can restore it when the layout changes.
+        keyA.setVisibility(View.GONE);
         enter.setAlpha(0f);
 
         View big = buildBigKey(root, enter, w, h, color);
         ((ViewGroup) root).getOverlay().add(big);
         big.layout(left, top, left + w, top + h);
 
+        sOverlayRoot = (ViewGroup) root;
+        sBigKey = big;
+        sHiddenEnter = enter;
+        sHiddenKeyA = keyA;
         sEnter = enter;
         sHit = new Rect(rc[0], e[1] - row, rc[0] + w, e[1] + origH);
+        sApplied = true;
 
-        Log.i(TAG, "merged key: [" + left + "," + top + " " + w + "x" + h + "]"
-                + " color=0x" + Integer.toHexString(color)
-                + " sampled=" + (sampled != 0)
-                + " hit=" + sHit + " keyA removed=" + (keyA.getParent() == null));
+        Log.i(TAG, "9-key active: merged key [" + left + "," + top + " "
+                + w + "x" + h + "] color=0x" + Integer.toHexString(color)
+                + " sampled=" + (sampled != 0) + " hit=" + sHit);
     }
 
     /** Paint a real key into a 1x1 canvas and read the resolved theme colour. */
@@ -313,14 +365,11 @@ public final class HookMain extends XposedModule {
         GradientDrawable gd = new GradientDrawable();
         gd.setColor(color);
         gd.setCornerRadius(26f);
+
         List<Drawable> cands = new ArrayList<>();
         collectIcons(enter, cands);
         Drawable chosen = null;
         for (Drawable d : cands) {
-            Log.i(TAG, "icon candidate " + d.getClass().getSimpleName()
-                    + " " + d.getIntrinsicWidth() + "x" + d.getIntrinsicHeight());
-            // GradientDrawable/ColorDrawable report -1; real glyphs are
-            // VectorDrawable/BitmapDrawable with a positive intrinsic size.
             if (chosen == null && d.getIntrinsicWidth() > 0
                     && d.getIntrinsicHeight() > 0) {
                 chosen = d;
@@ -339,6 +388,9 @@ public final class HookMain extends XposedModule {
         View key = new View(c) {
             @Override
             protected void onDraw(Canvas canvas) {
+                if (!sApplied) {
+                    return;             // defensive: never draw on other layouts
+                }
                 super.onDraw(canvas);
                 if (nativeIcon != null) {
                     int iw = nativeIcon.getIntrinsicWidth();
