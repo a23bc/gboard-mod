@@ -263,12 +263,14 @@ public final class HookMain extends XposedModule {
 
     /** Rounded key with a normal-size centred glyph - nothing is scaled. */
     private static View buildBigKey(View root, View donor, int w, int h) {
-        FrameLayout box = new FrameLayout(root.getContext());
+        // A single TextView. Overlay views are NOT measured/laid out, so a
+        // FrameLayout with a child leaves that child unlaid-out (blank key).
+        TextView tv = new TextView(root.getContext());
         boolean copied = false;
         try {
             Drawable src = findBackground(donor);
             if (src != null && src.getConstantState() != null) {
-                box.setBackground(src.getConstantState().newDrawable().mutate());
+                tv.setBackground(src.getConstantState().newDrawable().mutate());
                 copied = true;
             }
         } catch (Throwable ignored) {
@@ -278,20 +280,14 @@ public final class HookMain extends XposedModule {
             GradientDrawable gd = new GradientDrawable();
             gd.setColor(0xFF3C4252);
             gd.setCornerRadius(26f);
-            box.setBackground(gd);
+            tv.setBackground(gd);
         }
-        TextView glyph = new TextView(root.getContext());
-        glyph.setText("\u21B5");
-        glyph.setTextSize(34f);
-        glyph.setTextColor(Color.WHITE);
-        glyph.setGravity(Gravity.CENTER);
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.CENTER);
-        box.addView(glyph, lp);
+        tv.setText("\u21B5");
+        tv.setTextSize(34f);
+        tv.setTextColor(Color.WHITE);
+        tv.setGravity(Gravity.CENTER);
         Log.i(TAG, "big key built " + w + "x" + h + " backgroundCopied=" + copied);
-        return box;
+        return tv;
     }
 
     private static Drawable findBackground(View v) {
