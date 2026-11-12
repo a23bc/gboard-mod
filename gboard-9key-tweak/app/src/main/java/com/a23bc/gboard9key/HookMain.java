@@ -1,9 +1,15 @@
 package com.a23bc.gboard9key;
 
+import android.graphics.Color;
+import android.graphics.Rect;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
 import android.util.Log;
+import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.ViewParent;
+import android.widget.FrameLayout;
 import android.widget.TextView;
 
 import java.lang.reflect.Method;
@@ -15,32 +21,30 @@ import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
 /**
- * Gboard Chinese 9-key: make the ORIGINAL enter key occupy the two bottom-right
- * slots (row 3 right + row 4 right).
+ * Gboard Chinese 9-key: ONE tall enter key occupying both bottom-right slots,
+ * fully clickable, with NO stretched artwork.
  *
- * Measured on PJZ110 / Gboard 18.6.3:
- *   key_pos_del             [1219,2132 213x202] delete      (right column row 1)
- *   key_pos_move_cursor     [1219,2334 213x202] keyA        (right column row 2)
- *   key_pos_shift           [1219,2536 213x202] shift       (right column row 3)
- *   key_pos_ime_action      [1217,2738 215x206] enter       (BOTTOM ROW, sibling container)
+ * Measured on PJZ110 / Gboard 18.6.3 (window coords):
+ *   key_pos_move_cursor     [1219,2334 213x202] keyA    (right column row 2)
+ *   key_pos_shift           [1219,2536 213x202] shift   (right column row 3)
+ *   key_pos_ime_action      [1217,2738 215x206] enter   (BOTTOM ROW, sibling container)
  *   row pitch = 202px
  *
- * The right column (3 vertical rows) and the bottom row are SIBLING containers.
- * Changing LayoutParams.height triggers a cross-container relayout (verified:
- * enter was pushed off-screen). New views added to the root/overlay do not get
- * touch events on this InputView implementation (verified: zero forwarded
- * touches after tapping the upper half).
+ * Why this layered design (each earlier approach failed, see project memory):
+ *  - LayoutParams.height -> cross-container relayout, enter pushed off screen
+ *  - ViewGroupOverlay    -> drawn, but receives NO touch events
+ *  - real child layer    -> InputView (custom ViewGroup) does not dispatch to it
+ *  - scaleY on enter     -> glyph stretched; upper half unclickable because the
+ *                           bottom-row parent never receives that touch
  *
- * Final approach: keep the ORIGINAL enter view - it already owns the correct
- * touch/click logic - and grow it upward with a draw/hit transform:
- *   pivotY = bottom, scaleY = (h + row) / h
- * This does not touch any layout, so no relayout happens, and Android's
- * isTransformedTouchPointInView() applies the child matrix, so the whole
- * two-slot area is clickable. Ancestors need clipChildren=false so the grown
- * part is not clipped by the bottom-row container.
- *
- * keyA is removed for real, so shift slides up into row 2.
- * Result: delete | shift | one tall enter key spanning rows 3 and 4.
+ * Final:
+ *  VISUAL = a newly drawn, UNSCALED key on the root overlay (draw only).
+ *           Background copied from a real Gboard key when possible; the arrow
+ *           is a normal-size centred TextView, so nothing is stretched.
+ *  TOUCH  = hook dispatchTouchEvent along the InputView instance class chain.
+ *           Hits inside the merged rect are forwarded to the ORIGINAL enter
+ *           view (kept alive, alpha=0) and consumed, so the whole two-slot
+ *           area works and the lower half is not handled twice.
  *
  * Anchor: InputMethodService.setInputView(View). Keys located by resource id.
  */
@@ -62,6 +66,11 @@ public final class HookMain extends XposedModule {
 
     private static long lastDumpMs = 0L;
     private static final WeakHashMap<View, Boolean> APPLIED = new WeakHashMap<>();
+
+    private static volatile View sRoot;
+    private static volatile View sEnter;
+    private static volatile Rect sHit;      // window coordinates
+    private static volatile boolean sDispatchHooked = false;
 
     public HookMain() {
         super();
@@ -115,7 +124,7 @@ public final class HookMain extends XposedModule {
         }
     }
 
-    private static void onKeyboardView(View root) {
+    private void onKeyboardView(View root) {
         if (!(root instanceof ViewGroup) || root.getWidth() <= 0 || root.getHeight() <= 0) {
             Log.w(TAG, "root not laid out: " + root.getWidth() + "x" + root.getHeight());
             return;
@@ -132,8 +141,7 @@ public final class HookMain extends XposedModule {
         View shift = findKeyById(root, ID_SHIFT);
         View enter = findKeyById(root, ID_ENTER);
         if (keyA == null || shift == null || enter == null) {
-            Log.w(TAG, "id lookup failed: keyA=" + (keyA != null)
-                    + " shift=" + (shift != null) + " enter=" + (enter != null));
+            Log.w(TAG, "id lookup failed");
             return;
         }
         synchronized (APPLIED) {
@@ -142,7 +150,76 @@ public final class HookMain extends XposedModule {
             }
             APPLIED.put(enter, Boolean.TRUE);
         }
+        installDispatchHook(root);
         applyTweak(root, keyA, shift, enter);
+    }
+
+    /** Hook dispatchTouchEvent on every class in the instance chain that declares it. */
+    private void installDispatchHook(View root) {
+        sRoot = root;
+        if (sDispatchHooked) {
+            return;
+        }
+        int n = 0;
+        for (Class<?> c = root.getClass(); c != null && c != Object.class;
+             c = c.getSuperclass()) {
+            try {
+                Method m = c.getDeclaredMethod("dispatchTouchEvent", MotionEvent.class);
+                m.setAccessible(true);
+                hook(m).intercept(chain -> {
+                    try {
+                        Object self = chain.getThisObject();
+                        Object a0 = chain.getArg(0);
+                        if (self != sRoot || !(a0 instanceof MotionEvent)) {
+                            return chain.proceed();
+                        }
+                        MotionEvent ev = (MotionEvent) a0;
+                        Rect hit = sHit;
+                        View enter = sEnter;
+                        if (hit == null || enter == null) {
+                            return chain.proceed();
+                        }
+                        int[] r = new int[2];
+                        sRoot.getLocationInWindow(r);
+                        float x = ev.getX() + r[0];
+                        float y = ev.getY() + r[1];
+                        if (!hit.contains((int) x, (int) y)) {
+                            return chain.proceed();
+                        }
+                        int action = ev.getAction();
+                        if (action == MotionEvent.ACTION_DOWN
+                                || action == MotionEvent.ACTION_UP
+                                || action == MotionEvent.ACTION_CANCEL) {
+                            MotionEvent copy = MotionEvent.obtain(
+                                    ev.getDownTime(), ev.getEventTime(), action,
+                                    enter.getWidth() / 2f, enter.getHeight() / 2f,
+                                    ev.getMetaState());
+                            try {
+                                enter.dispatchTouchEvent(copy);
+                            } catch (Throwable t) {
+                                Log.w(TAG, "enter dispatch failed", t);
+                            } finally {
+                                copy.recycle();
+                            }
+                            Log.i(TAG, "dispatch forward action=" + action
+                                    + " at " + (int) x + "," + (int) y);
+                        }
+                        // Consume: prevents the bottom row handling it a 2nd time.
+                        return Boolean.TRUE;
+                    } catch (Throwable t) {
+                        Log.w(TAG, "dispatch intercept failed", t);
+                        return chain.proceed();
+                    }
+                });
+                n++;
+            } catch (NoSuchMethodException ignored) {
+                // this level does not declare dispatchTouchEvent
+            } catch (Throwable t) {
+                Log.w(TAG, "dispatch hook failed on " + c.getName(), t);
+            }
+        }
+        sDispatchHooked = n > 0;
+        Log.i(TAG, "dispatchTouchEvent hooked on " + n + " class(es)");
     }
 
     private static void applyTweak(View root, View keyA, View shift, View enter) {
@@ -152,38 +229,94 @@ public final class HookMain extends XposedModule {
             Log.w(TAG, "keyA has no ViewGroup parent");
             return;
         }
-        int row = shift.getHeight();       // 202
-        int h = enter.getHeight();         // 206
-        float scale = (h + row) / (float) h;
+        int row = shift.getHeight();
+        int[] e = location(enter);
+        int[] r = location(root);
+        int left = e[0] - r[0];
+        int top = e[1] - row - r[1];
+        int w = enter.getWidth();
+        int h = row + enter.getHeight();
 
         // 1) real delete -> shift slides up into row 2
         rightCol.removeView(keyA);
 
-        // 2) grow the ORIGINAL enter upward by one row; bottom edge stays put.
-        //    Draw/hit transform only: no LayoutParams change, no relayout.
-        enter.setPivotY(h);
-        enter.setScaleY(scale);
-        enter.bringToFront();
+        // 2) original enter stays alive (logic + touch target) but invisible
+        enter.setAlpha(0f);
 
-        // 3) let the grown part draw (and be hit-tested) outside its parent.
-        int levels = 0;
-        ViewParent p = enter.getParent();
-        while (p instanceof ViewGroup && levels < 8) {
-            ViewGroup vg = (ViewGroup) p;
-            vg.setClipChildren(false);
-            vg.setClipToPadding(false);
-            p = vg.getParent();
-            levels++;
-        }
+        // 3) draw ONE unstretched key covering both slots
+        View big = buildBigKey(root, shift, w, h);
+        ((ViewGroup) root).getOverlay().add(big);
+        big.setLeft(left);
+        big.setTop(top);
+        big.setRight(left + w);
+        big.setBottom(top + h);
 
-        Log.i(TAG, "enter spans two slots: h=" + h + " row=" + row
-                + " scale=" + scale + " keyA removed=" + (keyA.getParent() == null)
-                + " rightCol children=" + rightCol.getChildCount()
-                + " clipDisabledLevels=" + levels
-                + " enterTop=" + enter.getTop() + " enterBottom=" + enter.getBottom());
+        // 4) the whole rect is clickable through the dispatch hook
+        sEnter = enter;
+        sHit = new Rect(e[0], e[1] - row, e[0] + w, e[1] + enter.getHeight());
+
+        Log.i(TAG, "merged enter: visual [" + left + "," + top + " " + w + "x" + h + "]"
+                + " hit=" + sHit + " row=" + row
+                + " keyA removed=" + (keyA.getParent() == null)
+                + " rightCol children=" + rightCol.getChildCount());
     }
 
-    /** Resource entry names are plain text even when class names are R8-mangled. */
+    /** Rounded key with a normal-size centred glyph - nothing is scaled. */
+    private static View buildBigKey(View root, View donor, int w, int h) {
+        FrameLayout box = new FrameLayout(root.getContext());
+        boolean copied = false;
+        try {
+            Drawable src = findBackground(donor);
+            if (src != null && src.getConstantState() != null) {
+                box.setBackground(src.getConstantState().newDrawable().mutate());
+                copied = true;
+            }
+        } catch (Throwable ignored) {
+            // fall through
+        }
+        if (!copied) {
+            GradientDrawable gd = new GradientDrawable();
+            gd.setColor(0xFF3C4252);
+            gd.setCornerRadius(26f);
+            box.setBackground(gd);
+        }
+        TextView glyph = new TextView(root.getContext());
+        glyph.setText("\u21B5");
+        glyph.setTextSize(34f);
+        glyph.setTextColor(Color.WHITE);
+        glyph.setGravity(Gravity.CENTER);
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER);
+        box.addView(glyph, lp);
+        Log.i(TAG, "big key built " + w + "x" + h + " backgroundCopied=" + copied);
+        return box;
+    }
+
+    private static Drawable findBackground(View v) {
+        Drawable d = v.getBackground();
+        if (d != null) {
+            return d;
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                Drawable r = findBackground(g.getChildAt(i));
+                if (r != null) {
+                    return r;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static int[] location(View v) {
+        int[] loc = new int[2];
+        v.getLocationInWindow(loc);
+        return loc;
+    }
+
     private static View findKeyById(View root, String idName) {
         return findKeyById(root, idName, new int[1]);
     }
@@ -198,7 +331,7 @@ public final class HookMain extends XposedModule {
                 return v;
             }
         } catch (Throwable ignored) {
-            // resource name not resolvable for this id
+            // id not resolvable
         }
         if (v instanceof ViewGroup) {
             ViewGroup g = (ViewGroup) v;
@@ -212,7 +345,6 @@ public final class HookMain extends XposedModule {
         return null;
     }
 
-    /** Log only clickable keys, batched: ~36 lines instead of ~1500. */
     private static void dumpTree(View root) {
         Log.i(TAG, "========== KEYBOARD VIEW TREE ==========");
         Log.i(TAG, "root=" + root.getClass().getName()
