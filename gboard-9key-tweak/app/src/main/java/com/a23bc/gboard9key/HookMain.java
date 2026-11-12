@@ -1,25 +1,25 @@
 package com.a23bc.gboard9key;
 
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
-import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.util.Log;
-import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.TextView;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.WeakHashMap;
 
 import io.github.libxposed.api.XposedModule;
@@ -28,29 +28,20 @@ import io.github.libxposed.api.XposedModuleInterface;
 /**
  * Gboard Chinese 9-key: ONE tall enter key occupying both bottom-right slots.
  *
- * Measured on PJZ110 / Gboard 18.6.3 (window coords; screen coords are +160px):
- *   key_pos_move_cursor     [1219,2334 213x202] keyA    (right column row 2)
- *   key_pos_shift           [1219,2536 213x202] shift   (right column row 3)
- *   key_pos_ime_action      [1217,2738 215x206] enter   (BOTTOM ROW, sibling container)
- *   row pitch = 202px
+ * How Gboard itself colours keys (from assets/theme in base.apk):
+ *   style_sheet_dynamic_color_{dark,light,rules}.binarypb use color_gm3_* tokens
+ *   (color_gm3_surface_container_*, default_bordered_key_color ...), resolved at
+ *   runtime by DynamicColorThemeSpecProvider.parseDynamicColorSpec().
+ * Reproducing that token map is version/contrast dependent, so instead we
+ * SAMPLE the actual rendered pixel of a real key - whatever Gboard resolved is
+ * exactly what we paint. Re-sampled on every keyboard build, so it follows
+ * system dynamic-colour changes automatically.
  *
- * IMPORTANT FINDING: Gboard key BACKGROUNDS ARE NOT View.getBackground().
- * They are painted by the keyboard container, so reusing the native enter view
- * in an overlay yields the native glyph but NO key background (verified:
- * screenshot gboard-native-key.png). findBackground() returns null everywhere.
+ * The native enter glyph is drawn by calling draw() on Gboard's own icon View
+ * (finding a Drawable returned a GradientDrawable -1x-1, i.e. not the glyph).
  *
- * Therefore the merged key is drawn as its own FrameLayout:
- *  - geometry taken from the RIGHT COLUMN (not the bottom row) so edges align
- *  - background colour read at RUNTIME from the system dynamic-colour palette,
- *    so it follows Material You / system colour changes on every keyboard build
- *  - glyph = the ORIGINAL enter icon drawable, at intrinsic size, centred
- *    (never scaled). layout() is used instead of setLeft/Top so children are
- *    actually laid out and the icon is visible.
- *  - touches: original enter stays alive (alpha=0) in the bottom row; hook
- *    dispatchTouchEvent on the InputView instance chain, hit-test the merged
- *    rect in SCREEN coords and forward a complete MotionEvent copy.
- *
- * Anchor: InputMethodService.setInputView(View). Keys located by resource id.
+ * Layout: keyA removed for real; merged rect aligned to the RIGHT COLUMN;
+ * touches handled by hooking dispatchTouchEvent on the InputView class chain.
  */
 public final class HookMain extends XposedModule {
 
@@ -159,7 +150,6 @@ public final class HookMain extends XposedModule {
         applyTweak(root, keyA, shift, enter);
     }
 
-    /** Hook dispatchTouchEvent on every class in the instance chain that declares it. */
     private void installDispatchHook(View root) {
         sRoot = root;
         if (sDispatchHooked) {
@@ -189,10 +179,10 @@ public final class HookMain extends XposedModule {
                         if (!hit.contains((int) x, (int) y)) {
                             return chain.proceed();
                         }
-                        int action = ev.getAction();
                         if (sForwarding) {
                             return chain.proceed();
                         }
+                        int action = ev.getAction();
                         if (action == MotionEvent.ACTION_DOWN
                                 || action == MotionEvent.ACTION_UP
                                 || action == MotionEvent.ACTION_CANCEL) {
@@ -244,72 +234,100 @@ public final class HookMain extends XposedModule {
         int row = shift.getHeight();
         int origH = enter.getHeight();
         int[] e = location(enter);       // screen
-        int[] r = location(root);        // screen
-        int[] rc = location(rightCol);   // screen
+        int[] r = location(root);
+        int[] rc = location(rightCol);
 
-        // Align to the RIGHT COLUMN (bottom-row key is 2px off, wrong width).
+        // Sample BEFORE touching the tree: the real key colour as Gboard
+        // actually rendered it (dynamic colour / theme / contrast proof).
+        int sampled = sampleKeyColor(root, shift);
+        int color = sampled != 0 ? sampled : keyColor(root.getContext());
+
         int left = rc[0] - r[0];
         int top = rc[1] + 2 * row - r[1];
         int w = rightCol.getWidth();
         int h = row + origH;
 
-        // 1) real delete -> shift slides up into row 2
         rightCol.removeView(keyA);
-
-        // 2) original enter stays in the bottom row (avoids a reflow that
-        //    pushed the period key into the bottom-right corner).
         enter.setAlpha(0f);
 
-        // 3) draw the merged key. layout() (not setLeft/Top) so children are
-        //    laid out and the native glyph actually renders.
-        View big = buildBigKey(root, enter, w, h);
+        View big = buildBigKey(root, enter, w, h, color);
         ((ViewGroup) root).getOverlay().add(big);
         big.layout(left, top, left + w, top + h);
 
-        // 4) whole rect clickable via the dispatch hook (screen coords)
         sEnter = enter;
         sHit = new Rect(rc[0], e[1] - row, rc[0] + w, e[1] + origH);
 
         Log.i(TAG, "merged key: [" + left + "," + top + " " + w + "x" + h + "]"
-                + " hit=" + sHit + " row=" + row + " origH=" + origH
-                + " keyA removed=" + (keyA.getParent() == null));
+                + " color=0x" + Integer.toHexString(color)
+                + " sampled=" + (sampled != 0)
+                + " hit=" + sHit + " keyA removed=" + (keyA.getParent() == null));
     }
 
-    /** Rounded themed key with the ORIGINAL enter glyph at intrinsic size. */
-    private static View buildBigKey(View root, View enter, int w, int h) {
+    /** Paint a real key into a 1x1 canvas and read the resolved theme colour. */
+    private static int sampleKeyColor(View root, View key) {
+        try {
+            int[] k = new int[2];
+            int[] r = new int[2];
+            key.getLocationOnScreen(k);
+            root.getLocationOnScreen(r);
+            int bx = k[0] - r[0];
+            int by = k[1] - r[1];
+            int w = key.getWidth();
+            int h = key.getHeight();
+            int[][] pts = {
+                    {bx + 24, by + 24}, {bx + w - 24, by + 24},
+                    {bx + 24, by + h - 24}, {bx + w / 2, by + 24}
+            };
+            Map<Integer, Integer> votes = new HashMap<>();
+            for (int[] p : pts) {
+                Bitmap bmp = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
+                Canvas c = new Canvas(bmp);
+                c.translate(-p[0], -p[1]);
+                root.draw(c);
+                int col = bmp.getPixel(0, 0);
+                bmp.recycle();
+                if (Color.alpha(col) == 255) {
+                    Integer n = votes.get(col);
+                    votes.put(col, n == null ? 1 : n + 1);
+                }
+            }
+            int best = 0;
+            int max = 0;
+            for (Map.Entry<Integer, Integer> e : votes.entrySet()) {
+                if (e.getValue() > max) {
+                    max = e.getValue();
+                    best = e.getKey();
+                }
+            }
+            return best;
+        } catch (Throwable t) {
+            Log.w(TAG, "sampleKeyColor failed", t);
+            return 0;
+        }
+    }
+
+    /** One plain View; background + native icon drawn directly (no children). */
+    private static View buildBigKey(View root, View enter, int w, int h, int color) {
         Context c = root.getContext();
-        int color = keyColor(c);
         GradientDrawable gd = new GradientDrawable();
         gd.setColor(color);
         gd.setCornerRadius(26f);
-        Drawable found = findIcon(enter);
-        Drawable tmp = found;
-        if (found != null && found.getConstantState() != null) {
-            try {
-                tmp = found.getConstantState().newDrawable().mutate();
-            } catch (Throwable ignored) {
-                tmp = found;
-            }
-        }
-        final Drawable nativeIcon = tmp;
+        final View iconView = findIconView(enter);
 
-        // ONE plain View, no children. Overlay views are not measured or laid
-        // out, so ImageView/TextView-with-child tricks all render blank.
-        // Background is drawn by View.draw(); onDraw() centres the native icon
-        // with explicit bounds, at its intrinsic size (never scaled).
         View key = new View(c) {
             @Override
             protected void onDraw(Canvas canvas) {
                 super.onDraw(canvas);
-                if (nativeIcon != null) {
-                    int iw = nativeIcon.getIntrinsicWidth();
-                    int ih = nativeIcon.getIntrinsicHeight();
-                    if (iw <= 0) iw = 96;
-                    if (ih <= 0) ih = 96;
+                if (iconView != null && iconView.getWidth() > 0
+                        && iconView.getHeight() > 0) {
+                    int iw = iconView.getWidth();
+                    int ih = iconView.getHeight();
                     int l = (getWidth() - iw) / 2;
                     int t = (getHeight() - ih) / 2;
-                    nativeIcon.setBounds(l, t, l + iw, t + ih);
-                    nativeIcon.draw(canvas);
+                    canvas.save();
+                    canvas.translate(l, t);
+                    iconView.draw(canvas);   // Gboard paints its own glyph
+                    canvas.restore();
                 } else {
                     Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
                     p.setColor(Color.WHITE);
@@ -324,51 +342,40 @@ public final class HookMain extends XposedModule {
         key.setWillNotDraw(false);
         Log.i(TAG, "big key " + w + "x" + h
                 + " color=0x" + Integer.toHexString(color)
-                + " nativeIcon=" + (nativeIcon == null ? "null"
-                    : nativeIcon.getClass().getSimpleName() + " "
-                    + nativeIcon.getIntrinsicWidth() + "x"
-                    + nativeIcon.getIntrinsicHeight()));
+                + " iconView=" + (iconView == null ? "null"
+                    : iconView.getClass().getSimpleName() + " "
+                    + iconView.getWidth() + "x" + iconView.getHeight()));
         return key;
     }
 
-    /** Material You tonal palette - re-read on every keyboard build. */
+    /** Find Gboard's own visible icon View (often NonLinearScaleImageView). */
+    private static View findIconView(View v) {
+        if (v instanceof ImageView && v.getVisibility() == View.VISIBLE
+                && v.getWidth() > 0 && v.getHeight() > 0) {
+            return v;
+        }
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) {
+                View r = findIconView(g.getChildAt(i));
+                if (r != null) {
+                    return r;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Fallback only when pixel sampling fails. */
     private static int keyColor(Context c) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try {
-                // neutral2_800 sits between the too-dark neutral1_800 and the
-                // too-light neutral2_700, closest to Gboard's key surface.
                 return c.getColor(android.R.color.system_neutral2_800);
             } catch (Throwable ignored) {
                 // fall through
             }
         }
         return 0xFF3C4252;
-    }
-
-    private static Drawable findIcon(View v) {
-        if (v instanceof ImageView) {
-            Drawable d = ((ImageView) v).getDrawable();
-            if (d != null) {
-                return d;
-            }
-        }
-        if (v instanceof TextView) {
-            for (Drawable d : ((TextView) v).getCompoundDrawables()) {
-                if (d != null) {
-                    return d;
-                }
-            }
-        }
-        if (v instanceof ViewGroup) {
-            ViewGroup g = (ViewGroup) v;
-            for (int i = 0; i < g.getChildCount(); i++) {
-                Drawable d = findIcon(g.getChildAt(i));
-                if (d != null) {
-                    return d;
-                }
-            }
-        }
-        return null;
     }
 
     /** Screen coordinates - matches MotionEvent.getRawX()/getRawY(). */
