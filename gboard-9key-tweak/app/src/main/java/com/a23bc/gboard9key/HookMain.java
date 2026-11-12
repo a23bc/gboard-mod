@@ -13,9 +13,11 @@ import android.util.Log;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.inputmethod.EditorInfo;
 import android.widget.ImageView;
 import android.widget.TextView;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -120,7 +122,34 @@ public final class HookMain extends XposedModule {
                     }
                 }
             });
-            Log.i(TAG, "hook installed on setInputView, pid=" + android.os.Process.myPid());
+            // Secondary anchor. setInputView can fire BEFORE our hook is
+            // installed on a cold start; onStartInput runs on every focus
+            // change and lets us recover the current InputView via mInputView.
+            Method onStartInput = svc.getMethod("onStartInput",
+                    EditorInfo.class, boolean.class);
+            hook(onStartInput).intercept(chain -> {
+                Object result = chain.proceed();
+                try {
+                    Field f = InputMethodService.class.getDeclaredField("mInputView");
+                    f.setAccessible(true);
+                    Object iv = f.get(chain.getThisObject());
+                    if (iv instanceof View) {
+                        final View root = (View) iv;
+                        root.post(() -> {
+                            try {
+                                onKeyboardView(root);
+                            } catch (Throwable t) {
+                                Log.w(TAG, "onStartInput inspect failed", t);
+                            }
+                        });
+                    }
+                } catch (Throwable t) {
+                    Log.w(TAG, "onStartInput probe failed", t);
+                }
+                return result;
+            });
+            Log.i(TAG, "hooks installed (setInputView + onStartInput), pid="
+                    + android.os.Process.myPid());
         } catch (Throwable t) {
             Log.w(TAG, "hook install failed", t);
         }
