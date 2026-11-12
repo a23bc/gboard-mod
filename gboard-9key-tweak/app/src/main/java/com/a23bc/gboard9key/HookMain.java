@@ -286,20 +286,23 @@ public final class HookMain extends XposedModule {
         int[] r = location(root);
         int[] rc = location(rightCol);
 
-        int sampled = sampleKeyColor(root, shift);
-        int color = sampled != 0 ? sampled : keyColor(root.getContext());
-
         int left = rc[0] - r[0];
         int top = rc[1] + 2 * row - r[1];
         int w = rightCol.getWidth();
         int h = row + origH;
+
+        // Sample colour AND the real key-background edges before we alter the
+        // tree: Gboard keys are inset ~10px and the bottom row leaves ~41px.
+        int sampled = sampleKeyColor(root, shift);
+        int color = sampled != 0 ? sampled : keyColor(root.getContext());
+        int[] insets = measureKeyInsets(root, left, top, w, h, color);
 
         // GONE (reversible) instead of removeView: LinearLayout still slides
         // shift up, and cleanup() can restore it when the layout changes.
         keyA.setVisibility(View.GONE);
         enter.setAlpha(0f);
 
-        View big = buildBigKey(root, enter, w, h, color);
+        View big = buildBigKey(root, enter, w, h, color, insets);
         ((ViewGroup) root).getOverlay().add(big);
         big.layout(left, top, left + w, top + h);
 
@@ -313,7 +316,9 @@ public final class HookMain extends XposedModule {
 
         Log.i(TAG, "9-key active: merged key [" + left + "," + top + " "
                 + w + "x" + h + "] color=0x" + Integer.toHexString(color)
-                + " sampled=" + (sampled != 0) + " hit=" + sHit);
+                + " sampled=" + (sampled != 0)
+                + " bg=[" + insets[0] + "," + insets[1] + ","
+                + insets[2] + "," + insets[3] + "] hit=" + sHit);
     }
 
     /** Paint a real key into a 1x1 canvas and read the resolved theme colour. */
@@ -359,12 +364,63 @@ public final class HookMain extends XposedModule {
         }
     }
 
+    /** Find the REAL key-background edges (insets) by scanning rendered pixels. */
+    private static int[] measureKeyInsets(View root, int left, int top,
+                                          int w, int h, int bg) {
+        try {
+            Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            Canvas c = new Canvas(bmp);
+            c.translate(-left, -top);
+            root.draw(c);
+            int[] res = new int[]{0, 0, w - 1, h - 1};
+            int probeY = 70;                 // inside row 3, clear of the corner
+            int midX = w / 2;
+            for (int x = 0; x < w; x++) {
+                if (sameColor(bmp.getPixel(x, probeY), bg)) { res[0] = x; break; }
+            }
+            for (int x = w - 1; x >= 0; x--) {
+                if (sameColor(bmp.getPixel(x, probeY), bg)) { res[2] = x; break; }
+            }
+            for (int y = 0; y < h; y++) {
+                if (sameColor(bmp.getPixel(midX, y), bg)) { res[1] = y; break; }
+            }
+            for (int y = h - 1; y >= 0; y--) {
+                if (sameColor(bmp.getPixel(midX, y), bg)) { res[3] = y; break; }
+            }
+            bmp.recycle();
+            // Sanity: a failed scan would produce a full-bleed rectangle again.
+            if (res[2] - res[0] < w / 2 || res[3] - res[1] < h / 2) {
+                return new int[]{10, 0, w - 11, h - 41};
+            }
+            return res;
+        } catch (Throwable t) {
+            Log.w(TAG, "measureKeyInsets failed", t);
+            return new int[]{10, 0, w - 11, h - 41};
+        }
+    }
+
+    private static boolean sameColor(int a, int b) {
+        return Color.alpha(a) == 255
+                && Math.abs(Color.red(a) - Color.red(b)) <= 16
+                && Math.abs(Color.green(a) - Color.green(b)) <= 16
+                && Math.abs(Color.blue(a) - Color.blue(b)) <= 16;
+    }
+
     /** One plain View; background + native icon drawn directly (no children). */
-    private static View buildBigKey(View root, View enter, int w, int h, int color) {
+    private static View buildBigKey(View root, View enter, int w, int h,
+                                    int color, int[] insets) {
         Context c = root.getContext();
         GradientDrawable gd = new GradientDrawable();
         gd.setColor(color);
-        gd.setCornerRadius(26f);
+        // Top corners match the right-column keys (~24px); bottom corners
+        // inherit the original oval/capsule enter key's large roundness.
+        gd.setCornerRadii(new float[]{
+                24, 24,      // top-left
+                24, 24,      // top-right
+                88, 88,      // bottom-right
+                88, 88       // bottom-left
+        });
+        final int bl = insets[0], bt = insets[1], br = insets[2], bb = insets[3];
 
         List<Drawable> cands = new ArrayList<>();
         collectIcons(enter, cands);
@@ -391,15 +447,19 @@ public final class HookMain extends XposedModule {
                 if (!sApplied) {
                     return;             // defensive: never draw on other layouts
                 }
-                super.onDraw(canvas);
+                // Explicit inset bounds: never full-bleed the layout rect.
+                gd.setBounds(bl, bt, br, bb);
+                gd.draw(canvas);
+                int cx = (bl + br) / 2;
+                int cy = (bt + bb) / 2;
                 if (nativeIcon != null) {
                     int iw = nativeIcon.getIntrinsicWidth();
                     int ih = nativeIcon.getIntrinsicHeight();
                     float s = 96f / Math.max(iw, ih);
                     int dw = Math.round(iw * s);
                     int dh = Math.round(ih * s);
-                    int l = (getWidth() - dw) / 2;
-                    int t = (getHeight() - dh) / 2;
+                    int l = cx - dw / 2;
+                    int t = cy - dh / 2;
                     nativeIcon.setBounds(l, t, l + dw, t + dh);
                     nativeIcon.draw(canvas);
                 } else {
@@ -407,12 +467,11 @@ public final class HookMain extends XposedModule {
                     p.setColor(Color.WHITE);
                     p.setTextSize(90f);
                     p.setTextAlign(Paint.Align.CENTER);
-                    canvas.drawText("\u21B5", getWidth() / 2f,
-                            getHeight() / 2f + 30f, p);
+                    canvas.drawText("\u21B5", cx, cy + 30f, p);
                 }
             }
         };
-        key.setBackground(gd);
+        // No setBackground(): drawn at inset bounds inside onDraw.
         key.setWillNotDraw(false);
         Log.i(TAG, "big key " + w + "x" + h
                 + " color=0x" + Integer.toHexString(color)
