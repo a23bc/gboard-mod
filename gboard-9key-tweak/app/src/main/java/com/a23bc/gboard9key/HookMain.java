@@ -1,15 +1,18 @@
 package com.a23bc.gboard9key;
 
+import android.content.Context;
 import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.os.Build;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.TextView;
 
 import java.lang.reflect.Method;
@@ -21,30 +24,29 @@ import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
 /**
- * Gboard Chinese 9-key: ONE tall enter key occupying both bottom-right slots,
- * fully clickable, with NO stretched artwork.
+ * Gboard Chinese 9-key: ONE tall enter key occupying both bottom-right slots.
  *
- * Measured on PJZ110 / Gboard 18.6.3 (window coords):
+ * Measured on PJZ110 / Gboard 18.6.3 (window coords; screen coords are +160px):
  *   key_pos_move_cursor     [1219,2334 213x202] keyA    (right column row 2)
  *   key_pos_shift           [1219,2536 213x202] shift   (right column row 3)
  *   key_pos_ime_action      [1217,2738 215x206] enter   (BOTTOM ROW, sibling container)
  *   row pitch = 202px
  *
- * Why this layered design (each earlier approach failed, see project memory):
- *  - LayoutParams.height -> cross-container relayout, enter pushed off screen
- *  - ViewGroupOverlay    -> drawn, but receives NO touch events
- *  - real child layer    -> InputView (custom ViewGroup) does not dispatch to it
- *  - scaleY on enter     -> glyph stretched; upper half unclickable because the
- *                           bottom-row parent never receives that touch
+ * IMPORTANT FINDING: Gboard key BACKGROUNDS ARE NOT View.getBackground().
+ * They are painted by the keyboard container, so reusing the native enter view
+ * in an overlay yields the native glyph but NO key background (verified:
+ * screenshot gboard-native-key.png). findBackground() returns null everywhere.
  *
- * Final:
- *  VISUAL = a newly drawn, UNSCALED key on the root overlay (draw only).
- *           Background copied from a real Gboard key when possible; the arrow
- *           is a normal-size centred TextView, so nothing is stretched.
- *  TOUCH  = hook dispatchTouchEvent along the InputView instance class chain.
- *           Hits inside the merged rect are forwarded to the ORIGINAL enter
- *           view (kept alive, alpha=0) and consumed, so the whole two-slot
- *           area works and the lower half is not handled twice.
+ * Therefore the merged key is drawn as its own FrameLayout:
+ *  - geometry taken from the RIGHT COLUMN (not the bottom row) so edges align
+ *  - background colour read at RUNTIME from the system dynamic-colour palette,
+ *    so it follows Material You / system colour changes on every keyboard build
+ *  - glyph = the ORIGINAL enter icon drawable, at intrinsic size, centred
+ *    (never scaled). layout() is used instead of setLeft/Top so children are
+ *    actually laid out and the icon is visible.
+ *  - touches: original enter stays alive (alpha=0) in the bottom row; hook
+ *    dispatchTouchEvent on the InputView instance chain, hit-test the merged
+ *    rect in SCREEN coords and forward a complete MotionEvent copy.
  *
  * Anchor: InputMethodService.setInputView(View). Keys located by resource id.
  */
@@ -69,7 +71,7 @@ public final class HookMain extends XposedModule {
 
     private static volatile View sRoot;
     private static volatile View sEnter;
-    private static volatile Rect sHit;      // window coordinates
+    private static volatile Rect sHit;      // screen coordinates
     private static volatile boolean sDispatchHooked = false;
     private static volatile boolean sForwarding = false;
 
@@ -180,16 +182,12 @@ public final class HookMain extends XposedModule {
                         if (hit == null || enter == null) {
                             return chain.proceed();
                         }
-                        // Use ONE coordinate system everywhere: raw screen
-                        // coordinates vs. getLocationOnScreen() (see location()).
                         float x = ev.getRawX();
                         float y = ev.getRawY();
                         if (!hit.contains((int) x, (int) y)) {
                             return chain.proceed();
                         }
                         int action = ev.getAction();
-                        // Re-entrancy guard: Gboard's key handling can emit a
-                        // synthetic touch that lands back in this hook.
                         if (sForwarding) {
                             return chain.proceed();
                         }
@@ -198,8 +196,6 @@ public final class HookMain extends XposedModule {
                                 || action == MotionEvent.ACTION_CANCEL) {
                             sForwarding = true;
                             try {
-                                // Copy the COMPLETE event (source, deviceId,
-                                // pointers, flags); only rewrite its location.
                                 MotionEvent copy = MotionEvent.obtain(ev);
                                 copy.setLocation(enter.getWidth() / 2f,
                                         enter.getHeight() / 2f);
@@ -219,7 +215,6 @@ public final class HookMain extends XposedModule {
                                 sForwarding = false;
                             }
                         }
-                        // Consume: prevents the bottom row handling it a 2nd time.
                         return Boolean.TRUE;
                     } catch (Throwable t) {
                         Log.w(TAG, "dispatch intercept failed", t);
@@ -240,20 +235,17 @@ public final class HookMain extends XposedModule {
     private static void applyTweak(View root, View keyA, View shift, View enter) {
         ViewGroup rightCol = keyA.getParent() instanceof ViewGroup
                 ? (ViewGroup) keyA.getParent() : null;
-        ViewGroup bottomRow = enter.getParent() instanceof ViewGroup
-                ? (ViewGroup) enter.getParent() : null;
-        if (rightCol == null || bottomRow == null) {
-            Log.w(TAG, "unexpected parents");
+        if (rightCol == null) {
+            Log.w(TAG, "keyA has no ViewGroup parent");
             return;
         }
         int row = shift.getHeight();
         int origH = enter.getHeight();
-        int[] e = location(enter);       // screen coords
-        int[] r = location(root);
-        int[] rc = location(rightCol);
+        int[] e = location(enter);       // screen
+        int[] r = location(root);        // screen
+        int[] rc = location(rightCol);   // screen
 
-        // ALIGN to the right column, not to the bottom-row key (they differ by
-        // a couple of px). Row 3 starts two rows below the column top.
+        // Align to the RIGHT COLUMN (bottom-row key is 2px off, wrong width).
         int left = rc[0] - r[0];
         int top = rc[1] + 2 * row - r[1];
         int w = rightCol.getWidth();
@@ -262,67 +254,97 @@ public final class HookMain extends XposedModule {
         // 1) real delete -> shift slides up into row 2
         rightCol.removeView(keyA);
 
-        // 2) reuse the ORIGINAL enter view as the merged key. Its own onDraw
-        //    paints the themed background and its own children hold the real
-        //    enter glyph, so dynamic-colour themes follow automatically.
-        bottomRow.removeView(enter);
-        ((ViewGroup) root).getOverlay().add(enter);
-        enter.layout(left, top, left + w, top + h);
-        enter.setAlpha(1f);
-        enter.setVisibility(View.VISIBLE);
-        enter.bringToFront();
+        // 2) original enter stays in the bottom row (avoids a reflow that
+        //    pushed the period key into the bottom-right corner).
+        enter.setAlpha(0f);
 
-        // 3) whole rect clickable via the dispatch hook (screen coords)
+        // 3) draw the merged key. layout() (not setLeft/Top) so children are
+        //    laid out and the native glyph actually renders.
+        View big = buildBigKey(root, enter, w, h);
+        ((ViewGroup) root).getOverlay().add(big);
+        big.layout(left, top, left + w, top + h);
+
+        // 4) whole rect clickable via the dispatch hook (screen coords)
         sEnter = enter;
         sHit = new Rect(rc[0], e[1] - row, rc[0] + w, e[1] + origH);
 
-        Log.i(TAG, "merged NATIVE enter: [" + left + "," + top + " " + w + "x" + h + "]"
+        Log.i(TAG, "merged key: [" + left + "," + top + " " + w + "x" + h + "]"
                 + " hit=" + sHit + " row=" + row + " origH=" + origH
-                + " keyA removed=" + (keyA.getParent() == null)
-                + " rightCol children=" + rightCol.getChildCount()
-                + " bottomRow children=" + bottomRow.getChildCount());
+                + " keyA removed=" + (keyA.getParent() == null));
     }
 
-    /** Rounded key with a normal-size centred glyph - nothing is scaled. */
-    private static View buildBigKey(View root, View donor, int w, int h) {
-        // A single TextView. Overlay views are NOT measured/laid out, so a
-        // FrameLayout with a child leaves that child unlaid-out (blank key).
-        TextView tv = new TextView(root.getContext());
-        boolean copied = false;
-        try {
-            Drawable src = findBackground(donor);
-            if (src != null && src.getConstantState() != null) {
-                tv.setBackground(src.getConstantState().newDrawable().mutate());
-                copied = true;
+    /** Rounded themed key with the ORIGINAL enter glyph at intrinsic size. */
+    private static View buildBigKey(View root, View enter, int w, int h) {
+        Context c = root.getContext();
+        FrameLayout box = new FrameLayout(c);
+        int color = keyColor(c);
+        GradientDrawable gd = new GradientDrawable();
+        gd.setColor(color);
+        gd.setCornerRadius(26f);
+        box.setBackground(gd);
+
+        Drawable icon = findIcon(enter);
+        if (icon != null) {
+            ImageView iv = new ImageView(c);
+            try {
+                iv.setImageDrawable(icon.getConstantState() != null
+                        ? icon.getConstantState().newDrawable().mutate() : icon);
+            } catch (Throwable t) {
+                iv.setImageDrawable(icon);
             }
-        } catch (Throwable ignored) {
-            // fall through
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.CENTER);
+            box.addView(iv, lp);
+        } else {
+            TextView tv = new TextView(c);
+            tv.setText("\u21B5");
+            tv.setTextSize(34f);
+            tv.setTextColor(Color.WHITE);
+            tv.setGravity(Gravity.CENTER);
+            box.addView(tv, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT));
         }
-        if (!copied) {
-            GradientDrawable gd = new GradientDrawable();
-            gd.setColor(0xFF3C4252);
-            gd.setCornerRadius(26f);
-            tv.setBackground(gd);
-        }
-        tv.setText("\u21B5");
-        tv.setTextSize(34f);
-        tv.setTextColor(Color.WHITE);
-        tv.setGravity(Gravity.CENTER);
-        Log.i(TAG, "big key built " + w + "x" + h + " backgroundCopied=" + copied);
-        return tv;
+        Log.i(TAG, "big key " + w + "x" + h
+                + " color=0x" + Integer.toHexString(color)
+                + " nativeIcon=" + (icon != null));
+        return box;
     }
 
-    private static Drawable findBackground(View v) {
-        Drawable d = v.getBackground();
-        if (d != null) {
-            return d;
+    /** Material You tonal palette - re-read on every keyboard build. */
+    private static int keyColor(Context c) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                return c.getColor(android.R.color.system_neutral1_800);
+            } catch (Throwable ignored) {
+                // fall through
+            }
+        }
+        return 0xFF3C4252;
+    }
+
+    private static Drawable findIcon(View v) {
+        if (v instanceof ImageView) {
+            Drawable d = ((ImageView) v).getDrawable();
+            if (d != null) {
+                return d;
+            }
+        }
+        if (v instanceof TextView) {
+            for (Drawable d : ((TextView) v).getCompoundDrawables()) {
+                if (d != null) {
+                    return d;
+                }
+            }
         }
         if (v instanceof ViewGroup) {
             ViewGroup g = (ViewGroup) v;
             for (int i = 0; i < g.getChildCount(); i++) {
-                Drawable r = findBackground(g.getChildAt(i));
-                if (r != null) {
-                    return r;
+                Drawable d = findIcon(g.getChildAt(i));
+                if (d != null) {
+                    return d;
                 }
             }
         }
