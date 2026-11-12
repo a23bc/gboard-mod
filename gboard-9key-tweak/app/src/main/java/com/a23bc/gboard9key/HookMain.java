@@ -1,6 +1,11 @@
 package com.a23bc.gboard9key;
 
+import android.graphics.Color;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
 import android.util.Log;
+import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.TextView;
@@ -14,22 +19,27 @@ import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
 /**
- * Gboard Chinese 9-key right-column tweak, modern libxposed API (102).
+ * Gboard Chinese 9-key: make the enter key OCCUPY THE TWO BOTTOM-RIGHT SLOTS.
  *
- * Anchor: InputMethodService.setInputView(View) - the only reliable framework
- * anchor on Gboard (onCreateInputView/onStartInputView are overridden without
- * calling super, so hooks on them never fire).
- *
- * Keys are located by RESOURCE ID, which is not obfuscated. Measured on
- * PJZ110 / Gboard 18.6.3 (logs/g9k-20261112-031239.txt):
- *   key_pos_del             [1219,2132 213x202] delete
- *   key_pos_move_cursor     [1219,2334 213x202] 4-way arrow ("keyA")
- *   key_pos_shift           [1219,2536 213x202] caps / number mode
- *   key_pos_ime_action      [1217,2738 215x206] enter
+ * Measured on PJZ110 / Gboard 18.6.3:
+ *   key_pos_del             [1219,2132 213x202] delete      (right column row 1)
+ *   key_pos_move_cursor     [1219,2334 213x202] keyA        (right column row 2)
+ *   key_pos_shift           [1219,2536 213x202] shift       (right column row 3)
+ *   key_pos_ime_action      [1217,2738 215x206] enter       (BOTTOM ROW, sibling container)
  *   row pitch = 202px
  *
- * Desired: shift <-> keyA swap, hide keyA, grow enter upward by one row so it
- * swallows keyA's former slot. Result: delete | shift | enter (two rows tall).
+ * The right column (3 vertical rows) and the bottom row are SIBLING containers,
+ * so resizing enter always triggers a cross-container relayout (verified: enter
+ * was pushed off-screen). Instead:
+ *   1. remove keyA for real -> shift slides up into row 2
+ *   2. keep the original enter instance but make it invisible (logic intact)
+ *   3. add ONE real button on the keyboard root overlay covering
+ *      y = enter.top - row .. enter.bottom, x = enter.left .. enter.right
+ *   4. forward touches on that button to the original enter view
+ * Result: delete | shift | one big enter key spanning two slots.
+ *
+ * Anchor: InputMethodService.setInputView(View), the only reliable framework
+ * anchor on Gboard. Keys are found by resource id (not obfuscated).
  */
 public final class HookMain extends XposedModule {
 
@@ -87,7 +97,6 @@ public final class HookMain extends XposedModule {
                                 try {
                                     onKeyboardView(root);
                                 } catch (Throwable t) {
-                                    // Never let a hook crash the IME.
                                     Log.w(TAG, "inspect failed", t);
                                 }
                             });
@@ -104,7 +113,7 @@ public final class HookMain extends XposedModule {
     }
 
     private static void onKeyboardView(View root) {
-        if (root.getWidth() <= 0 || root.getHeight() <= 0) {
+        if (!(root instanceof ViewGroup) || root.getWidth() <= 0 || root.getHeight() <= 0) {
             Log.w(TAG, "root not laid out: " + root.getWidth() + "x" + root.getHeight());
             return;
         }
@@ -130,44 +139,96 @@ public final class HookMain extends XposedModule {
             }
             APPLIED.put(enter, Boolean.TRUE);
         }
-        applyTweak(keyA, shift, enter);
+        applyTweak(root, keyA, shift, enter);
     }
 
-    /**
-     * REAL merge: keyA is removed from the right column (so shift naturally
-     * moves up into its slot), and the enter key is reparented from the bottom
-     * row into the right column. One key ends up where two used to be.
-     *
-     * The two keys live in SIBLING containers - right column is child #3 of
-     * input_area (3 vertical rows), enter is in the bottom row container.
-     * That is why changing height/translation could never work: it triggers a
-     * cross-container relayout. Reparenting avoids touching any layout size.
-     */
-    private static void applyTweak(View keyA, View shift, View enter) {
+    private static void applyTweak(View root, View keyA, View shift, View enter) {
         ViewGroup rightCol = keyA.getParent() instanceof ViewGroup
                 ? (ViewGroup) keyA.getParent() : null;
-        ViewGroup bottomRow = enter.getParent() instanceof ViewGroup
-                ? (ViewGroup) enter.getParent() : null;
-        if (rightCol == null || bottomRow == null || rightCol == bottomRow) {
-            Log.w(TAG, "unexpected parents: rightCol=" + rightCol
-                    + " bottomRow=" + bottomRow);
+        if (rightCol == null) {
+            Log.w(TAG, "keyA has no ViewGroup parent");
             return;
         }
+        int row = shift.getHeight();                 // 202
+        int[] e = location(enter);                   // [1217,2738]
+        int[] r = location(root);                    // [0,0] on this device
+
+        // 1) real delete -> shift slides up into row 2
+        rightCol.removeView(keyA);
+
+        // 2) original enter becomes invisible but keeps its touch/click logic
+        enter.setAlpha(0f);
+
+        // 3) the merged key: one View covering row 3 + row 4 on the right
+        int left = e[0] - r[0];
+        int top = e[1] - row - r[1];
+        int w = enter.getWidth();
+        int h = row + enter.getHeight();
+        View big = buildBigEnter(root, enter);
+        ((ViewGroup) root).getOverlay().add(big);
+        big.setLeft(left);
+        big.setTop(top);
+        big.setRight(left + w);
+        big.setBottom(top + h);
+        big.bringToFront();
+        big.invalidate();
+
+        Log.i(TAG, "big enter merged: [" + left + "," + top + " " + w + "x" + h + "]"
+                + " row=" + row + " keyA removed=" + (keyA.getParent() == null)
+                + " rightCol children=" + rightCol.getChildCount());
+    }
+
+    /** A real clickable button (not a decoration) that forwards to the original enter. */
+    private static View buildBigEnter(View root, View enter) {
+        TextView tv = new TextView(root.getContext());
+        tv.setText("\u21B5");                       // ↵
+        tv.setTextSize(34f);
+        tv.setTextColor(Color.WHITE);
+        tv.setGravity(Gravity.CENTER);
+        tv.setClickable(true);
+        boolean copied = false;
         try {
-            // keyA already belongs to rightCol, so its LayoutParams instance is
-            // a valid one for addView() (generateLayoutParams is protected).
-            ViewGroup.LayoutParams lp = keyA.getLayoutParams();
-            rightCol.removeView(keyA);       // real delete -> shift slides up
-            bottomRow.removeView(enter);     // leave the bottom row
-            rightCol.addView(enter, lp);     // the merged key
-            Log.i(TAG, "merged: keyA removed; enter reparented"
-                    + " rightCol=" + rightCol.getClass().getSimpleName()
-                    + " children=" + rightCol.getChildCount()
-                    + " bottomRow children=" + bottomRow.getChildCount()
-                    + " shift=" + shift.getClass().getSimpleName());
-        } catch (Throwable t) {
-            Log.w(TAG, "merge failed", t);
+            Drawable bg = enter.getBackground();
+            if (bg != null && bg.getConstantState() != null) {
+                tv.setBackground(bg.getConstantState().newDrawable().mutate());
+                copied = true;
+            }
+        } catch (Throwable ignored) {
+            // fall through to a neutral fallback
         }
+        if (!copied) {
+            GradientDrawable gd = new GradientDrawable();
+            gd.setColor(0xFF3C4252);
+            gd.setCornerRadius(24f);
+            tv.setBackground(gd);
+        }
+        tv.setOnTouchListener((v, ev) -> forwardTo(enter, ev));
+        Log.i(TAG, "big enter built, backgroundCopied=" + copied);
+        return tv;
+    }
+
+    /** Re-dispatch a touch at the centre of the original enter view. */
+    private static boolean forwardTo(View enter, MotionEvent ev) {
+        MotionEvent copy = MotionEvent.obtain(
+                ev.getDownTime(), ev.getEventTime(), ev.getAction(),
+                enter.getWidth() / 2f, enter.getHeight() / 2f,
+                ev.getMetaState());
+        try {
+            Log.i(TAG, "forward action=" + ev.getAction()
+                    + " -> enter " + enter.getWidth() + "x" + enter.getHeight());
+            enter.dispatchTouchEvent(copy);
+        } catch (Throwable t) {
+            Log.w(TAG, "forward failed", t);
+        } finally {
+            copy.recycle();
+        }
+        return true;
+    }
+
+    private static int[] location(View v) {
+        int[] loc = new int[2];
+        v.getLocationInWindow(loc);
+        return loc;
     }
 
     /** Resource entry names are plain text even when class names are R8-mangled. */
