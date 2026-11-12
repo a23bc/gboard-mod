@@ -240,40 +240,47 @@ public final class HookMain extends XposedModule {
     private static void applyTweak(View root, View keyA, View shift, View enter) {
         ViewGroup rightCol = keyA.getParent() instanceof ViewGroup
                 ? (ViewGroup) keyA.getParent() : null;
-        if (rightCol == null) {
-            Log.w(TAG, "keyA has no ViewGroup parent");
+        ViewGroup bottomRow = enter.getParent() instanceof ViewGroup
+                ? (ViewGroup) enter.getParent() : null;
+        if (rightCol == null || bottomRow == null) {
+            Log.w(TAG, "unexpected parents");
             return;
         }
         int row = shift.getHeight();
-        int[] e = location(enter);
+        int origH = enter.getHeight();
+        int[] e = location(enter);       // screen coords
         int[] r = location(root);
-        int left = e[0] - r[0];
-        int top = e[1] - row - r[1];
-        int w = enter.getWidth();
-        int h = row + enter.getHeight();
+        int[] rc = location(rightCol);
+
+        // ALIGN to the right column, not to the bottom-row key (they differ by
+        // a couple of px). Row 3 starts two rows below the column top.
+        int left = rc[0] - r[0];
+        int top = rc[1] + 2 * row - r[1];
+        int w = rightCol.getWidth();
+        int h = row + origH;
 
         // 1) real delete -> shift slides up into row 2
         rightCol.removeView(keyA);
 
-        // 2) original enter stays alive (logic + touch target) but invisible
-        enter.setAlpha(0f);
+        // 2) reuse the ORIGINAL enter view as the merged key. Its own onDraw
+        //    paints the themed background and its own children hold the real
+        //    enter glyph, so dynamic-colour themes follow automatically.
+        bottomRow.removeView(enter);
+        ((ViewGroup) root).getOverlay().add(enter);
+        enter.layout(left, top, left + w, top + h);
+        enter.setAlpha(1f);
+        enter.setVisibility(View.VISIBLE);
+        enter.bringToFront();
 
-        // 3) draw ONE unstretched key covering both slots
-        View big = buildBigKey(root, shift, w, h);
-        ((ViewGroup) root).getOverlay().add(big);
-        big.setLeft(left);
-        big.setTop(top);
-        big.setRight(left + w);
-        big.setBottom(top + h);
-
-        // 4) the whole rect is clickable through the dispatch hook
+        // 3) whole rect clickable via the dispatch hook (screen coords)
         sEnter = enter;
-        sHit = new Rect(e[0], e[1] - row, e[0] + w, e[1] + enter.getHeight());
+        sHit = new Rect(rc[0], e[1] - row, rc[0] + w, e[1] + origH);
 
-        Log.i(TAG, "merged enter: visual [" + left + "," + top + " " + w + "x" + h + "]"
-                + " hit=" + sHit + " row=" + row
+        Log.i(TAG, "merged NATIVE enter: [" + left + "," + top + " " + w + "x" + h + "]"
+                + " hit=" + sHit + " row=" + row + " origH=" + origH
                 + " keyA removed=" + (keyA.getParent() == null)
-                + " rightCol children=" + rightCol.getChildCount());
+                + " rightCol children=" + rightCol.getChildCount()
+                + " bottomRow children=" + bottomRow.getChildCount());
     }
 
     /** Rounded key with a normal-size centred glyph - nothing is scaled. */
