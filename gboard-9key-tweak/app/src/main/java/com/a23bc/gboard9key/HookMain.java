@@ -276,48 +276,49 @@ public final class HookMain extends XposedModule {
     /** Rounded themed key with the ORIGINAL enter glyph at intrinsic size. */
     private static View buildBigKey(View root, View enter, int w, int h) {
         Context c = root.getContext();
-        FrameLayout box = new FrameLayout(c);
         int color = keyColor(c);
         GradientDrawable gd = new GradientDrawable();
         gd.setColor(color);
         gd.setCornerRadius(26f);
-        box.setBackground(gd);
 
         Drawable icon = findIcon(enter);
+        View key;
         if (icon != null) {
+            // ONE view carries both the background and the native glyph.
+            // A child View inside an overlay is never drawn, so a ViewGroup
+            // wrapper would leave the key blank (verified twice).
             ImageView iv = new ImageView(c);
+            iv.setBackground(gd);
             try {
                 iv.setImageDrawable(icon.getConstantState() != null
                         ? icon.getConstantState().newDrawable().mutate() : icon);
             } catch (Throwable t) {
                 iv.setImageDrawable(icon);
             }
-            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    Gravity.CENTER);
-            box.addView(iv, lp);
+            iv.setScaleType(ImageView.ScaleType.CENTER);  // intrinsic size
+            key = iv;
         } else {
             TextView tv = new TextView(c);
+            tv.setBackground(gd);
             tv.setText("\u21B5");
             tv.setTextSize(34f);
             tv.setTextColor(Color.WHITE);
             tv.setGravity(Gravity.CENTER);
-            box.addView(tv, new FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT));
+            key = tv;
         }
         Log.i(TAG, "big key " + w + "x" + h
                 + " color=0x" + Integer.toHexString(color)
                 + " nativeIcon=" + (icon != null));
-        return box;
+        return key;
     }
 
     /** Material You tonal palette - re-read on every keyboard build. */
     private static int keyColor(Context c) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try {
-                return c.getColor(android.R.color.system_neutral1_800);
+                // neutral2 is the slightly blue-toned Material You ramp, much
+                // closer to Gboard's key surfaces than neutral1_800 (too dark).
+                return c.getColor(android.R.color.system_neutral2_700);
             } catch (Throwable ignored) {
                 // fall through
             }
