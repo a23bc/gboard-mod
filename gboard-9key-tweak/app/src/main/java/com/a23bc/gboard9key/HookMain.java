@@ -165,17 +165,37 @@ public final class HookMain extends XposedModule {
         int w = enter.getWidth();
         int h = row + enter.getHeight();
         View big = buildBigEnter(root, enter);
-        ((ViewGroup) root).getOverlay().add(big);
-        big.setLeft(left);
-        big.setTop(top);
-        big.setRight(left + w);
-        big.setBottom(top + h);
+        ViewGroup vg = (ViewGroup) root;
+        boolean realChild = false;
+        try {
+            // Views added to ViewGroupOverlay are drawn but do NOT take part in
+            // touch dispatch (verified: zero "forward" log lines after tapping).
+            // A real child layer does, so the WHOLE two-slot button is clickable.
+            android.widget.FrameLayout layer =
+                    new android.widget.FrameLayout(root.getContext());
+            vg.addView(layer, new ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT));
+            android.widget.FrameLayout.LayoutParams blp =
+                    new android.widget.FrameLayout.LayoutParams(w, h);
+            blp.leftMargin = left;
+            blp.topMargin = top;
+            layer.addView(big, blp);
+            realChild = true;
+        } catch (Throwable t) {
+            Log.w(TAG, "layer addView failed, falling back to overlay", t);
+            vg.getOverlay().add(big);
+            big.setLeft(left);
+            big.setTop(top);
+            big.setRight(left + w);
+            big.setBottom(top + h);
+        }
         big.bringToFront();
-        big.invalidate();
 
         Log.i(TAG, "big enter merged: [" + left + "," + top + " " + w + "x" + h + "]"
                 + " row=" + row + " keyA removed=" + (keyA.getParent() == null)
-                + " rightCol children=" + rightCol.getChildCount());
+                + " rightCol children=" + rightCol.getChildCount()
+                + " realChild=" + realChild);
     }
 
     /** A real clickable button (not a decoration) that forwards to the original enter. */
