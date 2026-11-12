@@ -1,7 +1,9 @@
 package com.a23bc.gboard9key;
 
 import android.content.Context;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
@@ -280,35 +282,53 @@ public final class HookMain extends XposedModule {
         GradientDrawable gd = new GradientDrawable();
         gd.setColor(color);
         gd.setCornerRadius(26f);
-
-        Drawable icon = findIcon(enter);
-        View key;
-        if (icon != null) {
-            // ONE view carries both the background and the native glyph.
-            // A child View inside an overlay is never drawn, so a ViewGroup
-            // wrapper would leave the key blank (verified twice).
-            ImageView iv = new ImageView(c);
-            iv.setBackground(gd);
+        final Drawable nativeIcon;
+        Drawable found = findIcon(enter);
+        if (found != null && found.getConstantState() != null) {
             try {
-                iv.setImageDrawable(icon.getConstantState() != null
-                        ? icon.getConstantState().newDrawable().mutate() : icon);
+                nativeIcon = found.getConstantState().newDrawable().mutate();
             } catch (Throwable t) {
-                iv.setImageDrawable(icon);
+                nativeIcon = found;
             }
-            iv.setScaleType(ImageView.ScaleType.CENTER);  // intrinsic size
-            key = iv;
         } else {
-            TextView tv = new TextView(c);
-            tv.setBackground(gd);
-            tv.setText("\u21B5");
-            tv.setTextSize(34f);
-            tv.setTextColor(Color.WHITE);
-            tv.setGravity(Gravity.CENTER);
-            key = tv;
+            nativeIcon = found;
         }
+
+        // ONE plain View, no children. Overlay views are not measured or laid
+        // out, so ImageView/TextView-with-child tricks all render blank.
+        // Background is drawn by View.draw(); onDraw() centres the native icon
+        // with explicit bounds, at its intrinsic size (never scaled).
+        View key = new View(c) {
+            @Override
+            protected void onDraw(Canvas canvas) {
+                super.onDraw(canvas);
+                if (nativeIcon != null) {
+                    int iw = nativeIcon.getIntrinsicWidth();
+                    int ih = nativeIcon.getIntrinsicHeight();
+                    if (iw <= 0) iw = 96;
+                    if (ih <= 0) ih = 96;
+                    int l = (getWidth() - iw) / 2;
+                    int t = (getHeight() - ih) / 2;
+                    nativeIcon.setBounds(l, t, l + iw, t + ih);
+                    nativeIcon.draw(canvas);
+                } else {
+                    Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+                    p.setColor(Color.WHITE);
+                    p.setTextSize(90f);
+                    p.setTextAlign(Paint.Align.CENTER);
+                    canvas.drawText("\u21B5", getWidth() / 2f,
+                            getHeight() / 2f + 30f, p);
+                }
+            }
+        };
+        key.setBackground(gd);
+        key.setWillNotDraw(false);
         Log.i(TAG, "big key " + w + "x" + h
                 + " color=0x" + Integer.toHexString(color)
-                + " nativeIcon=" + (icon != null));
+                + " nativeIcon=" + (nativeIcon == null ? "null"
+                    : nativeIcon.getClass().getSimpleName() + " "
+                    + nativeIcon.getIntrinsicWidth() + "x"
+                    + nativeIcon.getIntrinsicHeight()));
         return key;
     }
 
@@ -316,9 +336,9 @@ public final class HookMain extends XposedModule {
     private static int keyColor(Context c) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             try {
-                // neutral2 is the slightly blue-toned Material You ramp, much
-                // closer to Gboard's key surfaces than neutral1_800 (too dark).
-                return c.getColor(android.R.color.system_neutral2_700);
+                // neutral2_800 sits between the too-dark neutral1_800 and the
+                // too-light neutral2_700, closest to Gboard's key surface.
+                return c.getColor(android.R.color.system_neutral2_800);
             } catch (Throwable ignored) {
                 // fall through
             }
