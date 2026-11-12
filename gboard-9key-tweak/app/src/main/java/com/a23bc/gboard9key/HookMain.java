@@ -282,17 +282,16 @@ public final class HookMain extends XposedModule {
         GradientDrawable gd = new GradientDrawable();
         gd.setColor(color);
         gd.setCornerRadius(26f);
-        final Drawable nativeIcon;
         Drawable found = findIcon(enter);
+        Drawable tmp = found;
         if (found != null && found.getConstantState() != null) {
             try {
-                nativeIcon = found.getConstantState().newDrawable().mutate();
-            } catch (Throwable t) {
-                nativeIcon = found;
+                tmp = found.getConstantState().newDrawable().mutate();
+            } catch (Throwable ignored) {
+                tmp = found;
             }
-        } else {
-            nativeIcon = found;
         }
+        final Drawable nativeIcon = tmp;
 
         // ONE plain View, no children. Overlay views are not measured or laid
         // out, so ImageView/TextView-with-child tricks all render blank.
