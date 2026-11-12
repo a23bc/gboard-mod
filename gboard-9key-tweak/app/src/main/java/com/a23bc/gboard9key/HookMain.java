@@ -179,10 +179,10 @@ public final class HookMain extends XposedModule {
                         if (hit == null || enter == null) {
                             return chain.proceed();
                         }
-                        int[] r = new int[2];
-                        sRoot.getLocationInWindow(r);
-                        float x = ev.getX() + r[0];
-                        float y = ev.getY() + r[1];
+                        // Use ONE coordinate system everywhere: raw screen
+                        // coordinates vs. getLocationOnScreen() (see location()).
+                        float x = ev.getRawX();
+                        float y = ev.getRawY();
                         if (!hit.contains((int) x, (int) y)) {
                             return chain.proceed();
                         }
@@ -307,9 +307,10 @@ public final class HookMain extends XposedModule {
         return null;
     }
 
+    /** Screen coordinates - matches MotionEvent.getRawX()/getRawY(). */
     private static int[] location(View v) {
         int[] loc = new int[2];
-        v.getLocationInWindow(loc);
+        v.getLocationOnScreen(loc);
         return loc;
     }
 
