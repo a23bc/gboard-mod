@@ -71,6 +71,7 @@ public final class HookMain extends XposedModule {
     private static volatile View sEnter;
     private static volatile Rect sHit;      // window coordinates
     private static volatile boolean sDispatchHooked = false;
+    private static volatile boolean sForwarding = false;
 
     public HookMain() {
         super();
@@ -187,22 +188,36 @@ public final class HookMain extends XposedModule {
                             return chain.proceed();
                         }
                         int action = ev.getAction();
+                        // Re-entrancy guard: Gboard's key handling can emit a
+                        // synthetic touch that lands back in this hook.
+                        if (sForwarding) {
+                            return chain.proceed();
+                        }
                         if (action == MotionEvent.ACTION_DOWN
                                 || action == MotionEvent.ACTION_UP
                                 || action == MotionEvent.ACTION_CANCEL) {
-                            MotionEvent copy = MotionEvent.obtain(
-                                    ev.getDownTime(), ev.getEventTime(), action,
-                                    enter.getWidth() / 2f, enter.getHeight() / 2f,
-                                    ev.getMetaState());
+                            sForwarding = true;
                             try {
-                                enter.dispatchTouchEvent(copy);
-                            } catch (Throwable t) {
-                                Log.w(TAG, "enter dispatch failed", t);
+                                // Copy the COMPLETE event (source, deviceId,
+                                // pointers, flags); only rewrite its location.
+                                MotionEvent copy = MotionEvent.obtain(ev);
+                                copy.setLocation(enter.getWidth() / 2f,
+                                        enter.getHeight() / 2f);
+                                boolean handled;
+                                try {
+                                    handled = enter.dispatchTouchEvent(copy);
+                                } finally {
+                                    copy.recycle();
+                                }
+                                if (!handled && action == MotionEvent.ACTION_UP) {
+                                    enter.performClick();
+                                }
+                                Log.i(TAG, "dispatch forward action=" + action
+                                        + " at " + (int) x + "," + (int) y
+                                        + " handled=" + handled);
                             } finally {
-                                copy.recycle();
+                                sForwarding = false;
                             }
-                            Log.i(TAG, "dispatch forward action=" + action
-                                    + " at " + (int) x + "," + (int) y);
                         }
                         // Consume: prevents the bottom row handling it a 2nd time.
                         return Boolean.TRUE;
