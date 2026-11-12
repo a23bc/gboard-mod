@@ -130,7 +130,7 @@ public final class HookMain extends XposedModule {
             hook(onStartInput).intercept(chain -> {
                 Object result = chain.proceed();
                 try {
-                    Field f = InputMethodService.class.getDeclaredField("mInputView");
+                    Field f = svc.getDeclaredField("mInputView");
                     f.setAccessible(true);
                     Object iv = f.get(chain.getThisObject());
                     if (iv instanceof View) {
