@@ -268,6 +268,12 @@ public final class HookMain extends XposedModule {
             if (v != null) {
                 v.postInvalidate();
             }
+            // The overlay View alone does not reliably schedule a traversal on
+            // a 2ms tap; invalidating the InputView forces the overlay to draw.
+            View r = sRoot;
+            if (r != null) {
+                r.invalidate();
+            }
         }
     }
 
