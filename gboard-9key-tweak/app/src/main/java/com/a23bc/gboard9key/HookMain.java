@@ -70,6 +70,8 @@ public final class HookMain extends XposedModule {
 
     // State machine: applied only while a 9-key layout is visible.
     private static volatile boolean sApplied = false;
+    private static volatile boolean sPressed = false;
+    private static volatile Rect sShiftRect;   // screen coords, never steal it
     private static volatile View sWatchedRoot;
     private static volatile View sBigKey;
     private static volatile View sHiddenEnter;
@@ -227,7 +229,16 @@ public final class HookMain extends XposedModule {
         sOverlayRoot = null;
         sEnter = null;
         sHit = null;
+        sShiftRect = null;
+        sPressed = false;
         sApplied = false;
+    }
+
+    private static void invalidateBigKey() {
+        View v = sBigKey;
+        if (v != null) {
+            v.postInvalidate();
+        }
     }
 
     private void installDispatchHook(View root) {
@@ -255,37 +266,31 @@ public final class HookMain extends XposedModule {
                         }
                         float x = ev.getRawX();
                         float y = ev.getRawY();
+                        Rect shiftRect = sShiftRect;
+                        if (shiftRect != null && shiftRect.contains((int) x, (int) y)) {
+                            return chain.proceed();   // never steal the shift key
+                        }
                         if (!hit.contains((int) x, (int) y)) {
                             return chain.proceed();
                         }
-                        if (sForwarding) {
-                            return chain.proceed();
-                        }
                         int action = ev.getAction();
-                        if (action == MotionEvent.ACTION_DOWN
-                                || action == MotionEvent.ACTION_UP
+                        if (action == MotionEvent.ACTION_DOWN) {
+                            sPressed = true;
+                            invalidateBigKey();
+                        } else if (action == MotionEvent.ACTION_UP
                                 || action == MotionEvent.ACTION_CANCEL) {
-                            sForwarding = true;
-                            try {
-                                MotionEvent copy = MotionEvent.obtain(ev);
-                                copy.setLocation(enter.getWidth() / 2f,
-                                        enter.getHeight() / 2f);
-                                boolean handled;
-                                try {
-                                    handled = enter.dispatchTouchEvent(copy);
-                                } finally {
-                                    copy.recycle();
-                                }
-                                if (!handled && action == MotionEvent.ACTION_UP) {
-                                    enter.performClick();
-                                }
-                                Log.i(TAG, "dispatch forward action=" + action
-                                        + " at " + (int) x + "," + (int) y
-                                        + " handled=" + handled);
-                            } finally {
-                                sForwarding = false;
+                            sPressed = false;
+                            invalidateBigKey();
+                            if (action == MotionEvent.ACTION_UP) {
+                                // Native action WITHOUT forwarding a touch:
+                                // forwarding made Gboard paint its pressed
+                                // state on the wrong (shift) key.
+                                enter.performClick();
                             }
                         }
+                        Log.i(TAG, "merged key action=" + action
+                                + " at " + (int) x + "," + (int) y
+                                + " pressed=" + sPressed);
                         return Boolean.TRUE;
                     } catch (Throwable t) {
                         Log.w(TAG, "dispatch intercept failed", t);
@@ -340,7 +345,14 @@ public final class HookMain extends XposedModule {
         sHiddenEnter = enter;
         sHiddenKeyA = keyA;
         sEnter = enter;
-        sHit = new Rect(rc[0], e[1] - row, rc[0] + w, e[1] + origH);
+        // Hit-test only the REAL painted background, not the whole layout rect.
+        int bigTopScreen = rc[1] + 2 * row;
+        sHit = new Rect(rc[0] + insets[0], bigTopScreen + insets[1],
+                        rc[0] + insets[2], bigTopScreen + insets[3]);
+        // shift slid up into row 2 when keyA went GONE; exclude it explicitly.
+        sShiftRect = new Rect(rc[0], rc[1] + row,
+                              rc[0] + w, rc[1] + 2 * row);
+        sPressed = false;
         sApplied = true;
 
         Log.i(TAG, "9-key active: merged key [" + left + "," + top + " "
@@ -446,9 +458,10 @@ public final class HookMain extends XposedModule {
         gd.setCornerRadii(new float[]{
                 24, 24,      // top-left
                 24, 24,      // top-right
-                88, 88,      // bottom-right
-                88, 88       // bottom-left
+                88, 88,      // bottom-right: ONLY this corner is large
+                24, 24       // bottom-left, same as the other three
         });
+        final int baseColor = color;
         final int bl = insets[0], bt = insets[1], br = insets[2], bb = insets[3];
 
         List<Drawable> cands = new ArrayList<>();
@@ -476,7 +489,9 @@ public final class HookMain extends XposedModule {
                 if (!sApplied) {
                     return;             // defensive: never draw on other layouts
                 }
-                // Explicit inset bounds: never full-bleed the layout rect.
+                // Explicit inset bounds + our own pressed-state feedback
+                // (Gboard's own pressed state is not available to overlay views).
+                gd.setColor(sPressed ? pressedColor(baseColor) : baseColor);
                 gd.setBounds(bl, bt, br, bb);
                 gd.draw(canvas);
                 int cx = (bl + br) / 2;
@@ -508,6 +523,14 @@ public final class HookMain extends XposedModule {
                 + " chosen=" + (nativeIcon == null ? "null"
                     : nativeIcon.getClass().getSimpleName()));
         return key;
+    }
+
+    /** Gboard dynamic-colour keys lighten when pressed. */
+    private static int pressedColor(int c) {
+        return Color.rgb(
+                Math.min(255, Color.red(c) + 26),
+                Math.min(255, Color.green(c) + 26),
+                Math.min(255, Color.blue(c) + 28));
     }
 
     private static void collectIcons(View v, List<Drawable> out) {
