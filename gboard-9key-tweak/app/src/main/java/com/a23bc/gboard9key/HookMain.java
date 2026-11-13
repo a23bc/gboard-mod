@@ -11,7 +11,6 @@ import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.SystemClock;
 import android.util.Log;
-import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -277,7 +276,12 @@ public final class HookMain extends XposedModule {
         }
     }
 
-    /** DOWN: highlight + native key-tap haptic, both immediately. */
+    /**
+     * DOWN: highlight + the ONE native click. Gboard's click handler carries
+     * its own key-tap haptic, so doing the click here gives exactly one
+     * vibration on press and leaves UP completely silent. No separate
+     * performHapticFeedback() call (that would make DOWN vibrate twice).
+     */
     private static void pressDown(View key, View enter) {
         Runnable old = sReleaseHighlight;
         if (old != null && key != null) {
@@ -286,9 +290,8 @@ public final class HookMain extends XposedModule {
         sPressedAt = SystemClock.uptimeMillis();
         setPressed(true);
         if (enter != null) {
-            boolean haptic = enter.performHapticFeedback(
-                    HapticFeedbackConstants.KEYBOARD_TAP);
-            Log.i(TAG, "haptic on DOWN=" + haptic);
+            enter.performClick();
+            Log.i(TAG, "click+haptic on DOWN (single vibration source)");
         }
     }
 
@@ -354,18 +357,13 @@ public final class HookMain extends XposedModule {
                         }
                         if (action == MotionEvent.ACTION_UP
                                 || action == MotionEvent.ACTION_CANCEL) {
-                            boolean fire = action == MotionEvent.ACTION_UP && inHit;
+                            // NO click / haptic on UP. The action already ran
+                            // on DOWN; doing it here was the second vibration.
                             pressUp(sBigKey);
                             sDownInMerged = false;
-                            if (fire) {
-                                // Native action WITHOUT forwarding a touch:
-                                // forwarding made Gboard paint its pressed
-                                // state on the wrong (shift) key.
-                                enter.performClick();
-                            }
                             Log.i(TAG, "merged " + (action == MotionEvent.ACTION_UP
                                     ? "UP" : "CANCEL") + " at " + (int) x + ","
-                                    + (int) y + " inHit=" + inHit + " fire=" + fire);
+                                    + (int) y + " inHit=" + inHit + " (silent)");
                             return Boolean.TRUE;
                         }
                         return Boolean.TRUE;          // rest of our session
