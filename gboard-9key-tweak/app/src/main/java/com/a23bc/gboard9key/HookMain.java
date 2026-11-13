@@ -9,7 +9,9 @@ import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
+import android.os.SystemClock;
 import android.util.Log;
+import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -72,6 +74,9 @@ public final class HookMain extends XposedModule {
     private static volatile boolean sApplied = false;
     private static volatile boolean sPressed = false;
     private static volatile boolean sDownInMerged = false;  // press session started here
+    private static volatile long sPressedAt = 0L;
+    private static volatile Runnable sReleaseHighlight = null;
+    private static final long MIN_PRESS_MS = 110L;          // let one frame render
     private static volatile Rect sShiftRect;   // screen coords, never steal it
     private static volatile View sWatchedRoot;
     private static volatile View sBigKey;
@@ -243,6 +248,13 @@ public final class HookMain extends XposedModule {
         sOverlayRoot = null;
         sEnter = null;
         sHit = null;
+        Runnable pending = sReleaseHighlight;
+        View v = sBigKey;
+        if (pending != null && v != null) {
+            v.removeCallbacks(pending);
+        }
+        sReleaseHighlight = null;
+        sPressedAt = 0L;
         sShiftRect = null;
         sPressed = false;
         sDownInMerged = false;
@@ -256,6 +268,34 @@ public final class HookMain extends XposedModule {
             if (v != null) {
                 v.postInvalidate();
             }
+        }
+    }
+
+    /** DOWN: show highlight immediately and fire the native tap haptic NOW. */
+    private static void pressDown(View key, View enter) {
+        Runnable old = sReleaseHighlight;
+        if (old != null && key != null) {
+            key.removeCallbacks(old);            // cancel a previous quick tap
+        }
+        sPressedAt = SystemClock.uptimeMillis();
+        setPressed(true);
+        if (enter != null) {
+            boolean haptic = enter.performHapticFeedback(
+                    HapticFeedbackConstants.KEYBOARD_TAP);
+            Log.i(TAG, "haptic on DOWN=" + haptic);
+        }
+    }
+
+    /** UP/CANCEL: keep the highlight for at least MIN_PRESS_MS so one frame draws. */
+    private static void pressUp(View key) {
+        long elapsed = SystemClock.uptimeMillis() - sPressedAt;
+        long delay = Math.max(0L, MIN_PRESS_MS - elapsed);
+        Runnable r = () -> setPressed(false);
+        sReleaseHighlight = r;
+        if (key != null) {
+            key.postDelayed(r, delay);
+        } else {
+            setPressed(false);
         }
     }
 
@@ -295,7 +335,7 @@ public final class HookMain extends XposedModule {
                                 return chain.proceed();
                             }
                             sDownInMerged = true;
-                            setPressed(true);
+                            pressDown(sBigKey, enter);
                             Log.i(TAG, "merged DOWN at " + (int) x + "," + (int) y);
                             return Boolean.TRUE;
                         }
@@ -311,7 +351,7 @@ public final class HookMain extends XposedModule {
                         if (action == MotionEvent.ACTION_UP
                                 || action == MotionEvent.ACTION_CANCEL) {
                             boolean fire = action == MotionEvent.ACTION_UP && inHit;
-                            setPressed(false);        // ALWAYS reset, anywhere
+                            pressUp(sBigKey);         // delayed clear, anywhere
                             sDownInMerged = false;
                             if (fire) {
                                 // Native action WITHOUT forwarding a touch:
@@ -561,9 +601,9 @@ public final class HookMain extends XposedModule {
     /** Gboard dynamic-colour keys lighten when pressed. */
     private static int pressedColor(int c) {
         return Color.rgb(
-                Math.min(255, Color.red(c) + 38),
-                Math.min(255, Color.green(c) + 38),
-                Math.min(255, Color.blue(c) + 40));
+                Math.min(255, Color.red(c) + 26),
+                Math.min(255, Color.green(c) + 26),
+                Math.min(255, Color.blue(c) + 28));
     }
 
     private static void collectIcons(View v, List<Drawable> out) {
