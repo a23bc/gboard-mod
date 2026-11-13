@@ -9,7 +9,6 @@ import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
-import android.os.SystemClock;
 import android.util.Log;
 import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
@@ -72,11 +71,7 @@ public final class HookMain extends XposedModule {
 
     // State machine: applied only while a 9-key layout is visible.
     private static volatile boolean sApplied = false;
-    private static volatile boolean sPressed = false;
     private static volatile boolean sDownInMerged = false;  // press session started here
-    private static volatile long sPressedAt = 0L;
-    private static volatile Runnable sReleaseHighlight = null;
-    private static final long MIN_PRESS_MS = 110L;          // let one frame render
     private static volatile Rect sShiftRect;   // screen coords, never steal it
     private static volatile View sWatchedRoot;
     private static volatile View sBigKey;
@@ -248,60 +243,17 @@ public final class HookMain extends XposedModule {
         sOverlayRoot = null;
         sEnter = null;
         sHit = null;
-        Runnable pending = sReleaseHighlight;
-        View v = sBigKey;
-        if (pending != null && v != null) {
-            v.removeCallbacks(pending);
-        }
-        sReleaseHighlight = null;
-        sPressedAt = 0L;
         sShiftRect = null;
-        sPressed = false;
         sDownInMerged = false;
         sApplied = false;
     }
 
-    private static void setPressed(boolean p) {
-        if (sPressed != p) {
-            sPressed = p;
-            View v = sBigKey;
-            if (v != null) {
-                v.postInvalidate();
-            }
-            // The overlay View alone does not reliably schedule a traversal on
-            // a 2ms tap; invalidating the InputView forces the overlay to draw.
-            View r = sRoot;
-            if (r != null) {
-                r.invalidate();
-            }
-        }
-    }
-
-    /** DOWN: show highlight immediately and fire the native tap haptic NOW. */
-    private static void pressDown(View key, View enter) {
-        Runnable old = sReleaseHighlight;
-        if (old != null && key != null) {
-            key.removeCallbacks(old);            // cancel a previous quick tap
-        }
-        sPressedAt = SystemClock.uptimeMillis();
-        setPressed(true);
+    /** DOWN: fire the native key-tap haptic immediately. No visual tint. */
+    private static void fireHaptic(View enter) {
         if (enter != null) {
             boolean haptic = enter.performHapticFeedback(
                     HapticFeedbackConstants.KEYBOARD_TAP);
             Log.i(TAG, "haptic on DOWN=" + haptic);
-        }
-    }
-
-    /** UP/CANCEL: keep the highlight for at least MIN_PRESS_MS so one frame draws. */
-    private static void pressUp(View key) {
-        long elapsed = SystemClock.uptimeMillis() - sPressedAt;
-        long delay = Math.max(0L, MIN_PRESS_MS - elapsed);
-        Runnable r = () -> setPressed(false);
-        sReleaseHighlight = r;
-        if (key != null) {
-            key.postDelayed(r, delay);
-        } else {
-            setPressed(false);
         }
     }
 
@@ -341,7 +293,7 @@ public final class HookMain extends XposedModule {
                                 return chain.proceed();
                             }
                             sDownInMerged = true;
-                            pressDown(sBigKey, enter);
+                            fireHaptic(enter);
                             Log.i(TAG, "merged DOWN at " + (int) x + "," + (int) y);
                             return Boolean.TRUE;
                         }
@@ -349,15 +301,11 @@ public final class HookMain extends XposedModule {
                             return chain.proceed();   // not our press session
                         }
                         if (action == MotionEvent.ACTION_MOVE) {
-                            // Native keys un-highlight when the finger slides
-                            // out and re-highlight when it slides back in.
-                            setPressed(inHit);
-                            return Boolean.TRUE;
+                            return Boolean.TRUE;      // keep session, no visual state
                         }
                         if (action == MotionEvent.ACTION_UP
                                 || action == MotionEvent.ACTION_CANCEL) {
                             boolean fire = action == MotionEvent.ACTION_UP && inHit;
-                            pressUp(sBigKey);         // delayed clear, anywhere
                             sDownInMerged = false;
                             if (fire) {
                                 // Native action WITHOUT forwarding a touch:
@@ -431,7 +379,6 @@ public final class HookMain extends XposedModule {
         // shift slid up into row 2 when keyA went GONE; exclude it explicitly.
         sShiftRect = new Rect(rc[0], rc[1] + row,
                               rc[0] + w, rc[1] + 2 * row);
-        sPressed = false;
         sApplied = true;
 
         Log.i(TAG, "9-key active: merged key [" + left + "," + top + " "
@@ -540,7 +487,6 @@ public final class HookMain extends XposedModule {
                 88, 88,      // bottom-right: ONLY this corner is large
                 24, 24       // bottom-left, same as the other three
         });
-        final int baseColor = color;
         final int bl = insets[0], bt = insets[1], br = insets[2], bb = insets[3];
 
         List<Drawable> cands = new ArrayList<>();
@@ -568,9 +514,7 @@ public final class HookMain extends XposedModule {
                 if (!sApplied) {
                     return;             // defensive: never draw on other layouts
                 }
-                // Explicit inset bounds + our own pressed-state feedback
-                // (Gboard's own pressed state is not available to overlay views).
-                gd.setColor(sPressed ? pressedColor(baseColor) : baseColor);
+                // Fixed theme colour at the measured inset bounds. No tint.
                 gd.setBounds(bl, bt, br, bb);
                 gd.draw(canvas);
                 int cx = (bl + br) / 2;
@@ -602,14 +546,6 @@ public final class HookMain extends XposedModule {
                 + " chosen=" + (nativeIcon == null ? "null"
                     : nativeIcon.getClass().getSimpleName()));
         return key;
-    }
-
-    /** Gboard dynamic-colour keys lighten when pressed. */
-    private static int pressedColor(int c) {
-        return Color.rgb(
-                Math.min(255, Color.red(c) + 26),
-                Math.min(255, Color.green(c) + 26),
-                Math.min(255, Color.blue(c) + 28));
     }
 
     private static void collectIcons(View v, List<Drawable> out) {
