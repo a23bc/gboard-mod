@@ -192,6 +192,19 @@ public final class HookMain extends XposedModule {
     private static void evaluate(View root) {
         boolean is9Key = findKeyById(root, ID_9KEY_1) != null
                 && findKeyById(root, ID_ENTER) != null;
+        if (is9Key && sApplied) {
+            // performClick() makes Gboard refresh the keyboard and reset key
+            // visibility/alpha; re-assert our state every frame.
+            View k = sHiddenKeyA;
+            if (k != null && k.getVisibility() != View.GONE) {
+                k.setVisibility(View.GONE);
+            }
+            View e = sHiddenEnter;
+            if (e != null && e.getAlpha() != 0f) {
+                e.setAlpha(0f);
+            }
+            return;
+        }
         if (is9Key == sApplied) {
             return;
         }
