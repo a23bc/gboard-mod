@@ -464,15 +464,20 @@ public final class HookMain extends XposedModule {
                         }
                         MotionEvent ev = (MotionEvent) a0;
                         View eventRoot = (View) self;
-                        // A theme change can install a new InputView without
-                        // firing either anchor. Adopt it from the touch stream.
                         if (eventRoot != sRoot) {
+                            // Hooks are installed along the class chain, so self
+                            // can be ANY child ViewGroup. Never let a key tap
+                            // replace sRoot: that made evaluate() see a partial
+                            // tree and tear the merged key down. Only a full
+                            // InputView (both the 9-key grid and enter) qualifies.
+                            if (ev.getActionMasked() != MotionEvent.ACTION_DOWN
+                                    || findKeyById(eventRoot, ID_9KEY_1) == null
+                                    || findKeyById(eventRoot, ID_ENTER) == null) {
+                                return chain.proceed();
+                            }
                             sRoot = eventRoot;
-                            installPreDrawWatcher(eventRoot);
+                            installPreDrawWatcher(eventRoot);  // re-eval next frame
                             Log.i(TAG, "adopted InputView from touch");
-                        }
-                        if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                            evaluate(eventRoot);   // self-heal colour/overlay
                         }
                         Rect hit = sHit;
                         View enter = sEnter;
