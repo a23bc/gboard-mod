@@ -214,7 +214,15 @@ public final class HookMain extends XposedModule {
             }
         }
         sWatchedRoot = root;
-        ViewTreeObserver.OnPreDrawListener listener = () -> {
+        // removeOnPreDrawListener can fail when the ViewTreeObserver instance
+        // was replaced during a theme rebuild. Self-identify instead: only the
+        // listener currently registered in sPreDrawListener may evaluate.
+        final ViewTreeObserver.OnPreDrawListener[] holder =
+                new ViewTreeObserver.OnPreDrawListener[1];
+        holder[0] = () -> {
+            if (sPreDrawListener != holder[0]) {
+                return true;            // stale watcher, do nothing
+            }
             try {
                 evaluate(root);
             } catch (Throwable t) {
@@ -222,9 +230,9 @@ public final class HookMain extends XposedModule {
             }
             return true;
         };
-        sPreDrawListener = listener;
-        root.getViewTreeObserver().addOnPreDrawListener(listener);
-        Log.i(TAG, "predraw watcher installed (old detached)");
+        sPreDrawListener = holder[0];
+        root.getViewTreeObserver().addOnPreDrawListener(holder[0]);
+        Log.i(TAG, "predraw watcher installed (old detached, self-guarded)");
     }
 
     private static void evaluate(View root) {
