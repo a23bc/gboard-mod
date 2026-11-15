@@ -1,6 +1,7 @@
 package com.a23bc.gboard9key;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -11,6 +12,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.SystemClock;
 import android.util.Log;
+import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -77,6 +79,10 @@ public final class HookMain extends XposedModule {
     private static volatile Runnable sReleaseHighlight = null;
     private static final long MIN_PRESS_MS = 110L;   // guarantee one painted frame
     private static volatile int sPressedFrames = 0;
+    // Long-press detection, mirroring Gboard's postDelayed(longPressDelay) model.
+    private static volatile boolean sLongPressFired = false;
+    private static volatile Runnable sLongPressTask = null;
+    private static volatile int sLongPressMs = 300;   // Gboard default
     private static volatile Rect sShiftRect;   // screen coords, never steal it
     private static volatile View sWatchedRoot;
     private static volatile View sBigKey;
@@ -253,6 +259,8 @@ public final class HookMain extends XposedModule {
         if (pending != null && key != null) {
             key.removeCallbacks(pending);
         }
+        cancelLongPress();
+        sLongPressFired = false;
         sReleaseHighlight = null;
         sPressedAt = 0L;
         sPressed = false;
@@ -276,22 +284,60 @@ public final class HookMain extends XposedModule {
         }
     }
 
+    /** Gboard's pref_key_key_long_press_delay, else its 300ms default. */
+    private static int readLongPressMs(Context c) {
+        try {
+            SharedPreferences sp = c.getSharedPreferences(
+                    "com.google.android.inputmethod.latin_preferences",
+                    Context.MODE_PRIVATE);
+            String v = sp.getString("pref_key_key_long_press_delay", null);
+            if (v != null) {
+                int ms = Integer.parseInt(v.trim());
+                if (ms >= 100 && ms <= 2000) {
+                    return ms;
+                }
+            }
+        } catch (Throwable ignored) {
+            // key absent or non-numeric -> Gboard default
+        }
+        return 300;
+    }
+
+    private static void cancelLongPress() {
+        Runnable task = sLongPressTask;
+        View key = sBigKey;
+        if (task != null && key != null) {
+            key.removeCallbacks(task);
+        }
+        sLongPressTask = null;
+    }
+
     /**
-     * DOWN: highlight + the ONE native click. Gboard's click handler carries
-     * its own key-tap haptic, so doing the click here gives exactly one
-     * vibration on press and leaves UP completely silent. No separate
-     * performHapticFeedback() call (that would make DOWN vibrate twice).
+     * DOWN: highlight + ONE native click (its own haptic) + arm a
+     * postDelayed(longPressDelay) timer, mirroring Gboard's long-press model.
      */
     private static void pressDown(View key, View enter) {
         Runnable old = sReleaseHighlight;
         if (old != null && key != null) {
             key.removeCallbacks(old);
         }
+        cancelLongPress();
+        sLongPressFired = false;
         sPressedAt = SystemClock.uptimeMillis();
         setPressed(true);
         if (enter != null) {
             enter.performClick();
             Log.i(TAG, "click+haptic on DOWN (single vibration source)");
+        }
+        Runnable task = () -> {
+            sLongPressFired = true;
+            Log.i(TAG, "long press fired after " + sLongPressMs + "ms");
+        };
+        sLongPressTask = task;
+        if (key != null) {
+            key.postDelayed(task, sLongPressMs);
+        } else {
+            task.run();
         }
     }
 
@@ -352,18 +398,30 @@ public final class HookMain extends XposedModule {
                             return chain.proceed();   // not our press session
                         }
                         if (action == MotionEvent.ACTION_MOVE) {
+                            if (!inHit) {
+                                cancelLongPress();   // leaving the key aborts it
+                            }
                             setPressed(inHit);        // out = off, back in = on
                             return Boolean.TRUE;
                         }
                         if (action == MotionEvent.ACTION_UP
                                 || action == MotionEvent.ACTION_CANCEL) {
-                            // NO click / haptic on UP. The action already ran
-                            // on DOWN; doing it here was the second vibration.
+                            cancelLongPress();
                             pressUp(sBigKey);
                             sDownInMerged = false;
+                            // Gboard gives a second haptic only when a LONG
+                            // press is released. Short taps stay silent on UP.
+                            boolean longHaptic = action == MotionEvent.ACTION_UP
+                                    && sLongPressFired;
+                            if (longHaptic) {
+                                enter.performHapticFeedback(
+                                        HapticFeedbackConstants.KEYBOARD_TAP);
+                            }
+                            sLongPressFired = false;
                             Log.i(TAG, "merged " + (action == MotionEvent.ACTION_UP
                                     ? "UP" : "CANCEL") + " at " + (int) x + ","
-                                    + (int) y + " inHit=" + inHit + " (silent)");
+                                    + (int) y + " inHit=" + inHit
+                                    + (longHaptic ? " longPressHaptic" : " (silent)"));
                             return Boolean.TRUE;
                         }
                         return Boolean.TRUE;          // rest of our session
@@ -405,6 +463,7 @@ public final class HookMain extends XposedModule {
         int sampled = sampleKeyColor(root, shift);
         int color = sampled != 0 ? sampled : keyColor(root.getContext());
         int[] insets = measureKeyInsets(root, left, top, w, h, color);
+        sLongPressMs = readLongPressMs(root.getContext());
 
         // GONE (reversible) instead of removeView: LinearLayout still slides
         // shift up, and cleanup() can restore it when the layout changes.
@@ -605,12 +664,20 @@ public final class HookMain extends XposedModule {
         return key;
     }
 
-    /** Modest pressed-state tint. Recovery of the original +26, not +38. */
+    /**
+     * Material state layer: composite 10% white over a DARK key (lighten),
+     * 10% black over a LIGHT key (darken). A fixed +26 was wrong in light
+     * mode - it pushed (222,226,247) to near-white instead of a visible press.
+     */
     private static int pressedColor(int c) {
+        int r = Color.red(c), g = Color.green(c), b = Color.blue(c);
+        int lum = (r * 299 + g * 587 + b * 114) / 1000;
+        float a = 0.10f;
+        int t = lum > 140 ? 0 : 255;
         return Color.rgb(
-                Math.min(255, Color.red(c) + 26),
-                Math.min(255, Color.green(c) + 26),
-                Math.min(255, Color.blue(c) + 28));
+                Math.round(r * (1 - a) + t * a),
+                Math.round(g * (1 - a) + t * a),
+                Math.round(b * (1 - a) + t * a));
     }
 
     private static void collectIcons(View v, List<Drawable> out) {
