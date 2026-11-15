@@ -224,9 +224,11 @@ public final class HookMain extends XposedModule {
     }
 
     private static void evaluate(View root) {
-        // Ignore stale watchers from a destroyed InputView.
+        // A theme change can replace the InputView without re-firing
+        // setInputView/onStartInput. Adopt the new root instead of ignoring it.
         if (root != sRoot) {
-            return;
+            sRoot = root;
+            Log.i(TAG, "adopted new InputView root");
         }
         boolean is9Key = findKeyById(root, ID_9KEY_1) != null
                 && findKeyById(root, ID_ENTER) != null;
@@ -246,17 +248,23 @@ public final class HookMain extends XposedModule {
         }
         sNon9KeyFrames = 0;
         if (sApplied) {
-            // performClick() makes Gboard refresh the keyboard and reset key
-            // visibility/alpha; re-assert our state every frame.
-            View k = sHiddenKeyA;
-            if (k != null && k.getVisibility() != View.GONE) {
-                k.setVisibility(View.GONE);
+            if (sOverlayRoot != root) {
+                // Overlay belongs to a dead InputView -> rebuild on this one.
+                cleanup();
+                Log.i(TAG, "InputView replaced: rebuilding merged key");
+            } else {
+                // performClick() makes Gboard refresh the keyboard and reset
+                // key visibility/alpha; re-assert our state every frame.
+                View k = sHiddenKeyA;
+                if (k != null && k.getVisibility() != View.GONE) {
+                    k.setVisibility(View.GONE);
+                }
+                View e = sHiddenEnter;
+                if (e != null && e.getAlpha() != 0f) {
+                    e.setAlpha(0f);
+                }
+                return;
             }
-            View e = sHiddenEnter;
-            if (e != null && e.getAlpha() != 0f) {
-                e.setAlpha(0f);
-            }
-            return;
         }
         View keyA = findKeyById(root, ID_KEY_A);
         View shift = findKeyById(root, ID_SHIFT);
