@@ -88,6 +88,10 @@ public final class HookMain extends XposedModule {
     private static volatile View sWatchedRoot;
     private static volatile ViewTreeObserver.OnPreDrawListener sPreDrawListener = null;
     private static volatile int sNon9KeyFrames = 0;   // debounce layout churn
+    // Detect a theme change while the Gboard process stays alive.
+    private static volatile int sAppliedColour = 0;
+    private static volatile View sColourProbe = null;
+    private static volatile long sLastColourCheckMs = 0L;
     private static volatile View sBigKey;
     private static volatile View sHiddenEnter;
     private static volatile View sHiddenKeyA;
@@ -252,6 +256,8 @@ public final class HookMain extends XposedModule {
                 // Overlay belongs to a dead InputView -> rebuild on this one.
                 cleanup();
                 Log.i(TAG, "InputView replaced: rebuilding merged key");
+            } else if (themeColourChanged(root)) {
+                cleanup();              // re-sample colour, icon and insets
             } else {
                 // performClick() makes Gboard refresh the keyboard and reset
                 // key visibility/alpha; re-assert our state every frame.
@@ -308,7 +314,38 @@ public final class HookMain extends XposedModule {
         sShiftRect = null;
         sDownInMerged = false;
         sNon9KeyFrames = 0;
+        sAppliedColour = 0;
+        sColourProbe = null;
         sApplied = false;
+    }
+
+    /** Re-sample the real key colour periodically; a theme flip changes it. */
+    private static boolean themeColourChanged(View root) {
+        if (sPressed) {                 // never sample a highlighted key
+            return false;
+        }
+        long now = SystemClock.uptimeMillis();
+        if (now - sLastColourCheckMs < 400L) {
+            return false;
+        }
+        sLastColourCheckMs = now;
+        View probe = sColourProbe;
+        if (probe == null) {
+            return false;
+        }
+        int current = sampleKeyColor(root, probe);
+        if (current == 0) {
+            return false;
+        }
+        int old = sAppliedColour;
+        boolean changed = Math.abs(Color.red(current) - Color.red(old)) > 8
+                || Math.abs(Color.green(current) - Color.green(old)) > 8
+                || Math.abs(Color.blue(current) - Color.blue(old)) > 8;
+        if (changed) {
+            Log.i(TAG, "theme colour 0x" + Integer.toHexString(old)
+                    + " -> 0x" + Integer.toHexString(current) + ": rebuilding");
+        }
+        return changed;
     }
 
     private static void setPressed(boolean p) {
@@ -526,6 +563,9 @@ public final class HookMain extends XposedModule {
         // Hit-test only the REAL painted background, not the whole layout rect.
         int bigTopScreen = rc[1] + 2 * row;
         sPressed = false;
+        sAppliedColour = color;
+        sColourProbe = shift;
+        sLastColourCheckMs = SystemClock.uptimeMillis();
         sHit = new Rect(rc[0] + insets[0], bigTopScreen + insets[1],
                         rc[0] + insets[2], bigTopScreen + insets[3]);
         // shift slid up into row 2 when keyA went GONE; exclude it explicitly.
