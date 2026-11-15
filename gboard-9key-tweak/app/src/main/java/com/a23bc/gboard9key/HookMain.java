@@ -197,7 +197,7 @@ public final class HookMain extends XposedModule {
      * single global sApplied and flip cleanup/apply every frame. Always detach
      * the previous listener first.
      */
-    private void installPreDrawWatcher(View root) {
+    private static void installPreDrawWatcher(View root) {
         if (sWatchedRoot == root) {
             return;
         }
@@ -240,6 +240,7 @@ public final class HookMain extends XposedModule {
         // setInputView/onStartInput. Adopt the new root instead of ignoring it.
         if (root != sRoot) {
             sRoot = root;
+            installPreDrawWatcher(root);   // ensure the new root has a watcher
             Log.i(TAG, "adopted new InputView root");
         }
         boolean is9Key = findKeyById(root, ID_9KEY_1) != null
@@ -456,11 +457,23 @@ public final class HookMain extends XposedModule {
                 hook(m).intercept(chain -> {
                     try {
                         Object a0 = chain.getArg(0);
-                        if (!sApplied || chain.getThisObject() != sRoot
+                        Object self = chain.getThisObject();
+                        if (!sApplied || !(self instanceof View)
                                 || !(a0 instanceof MotionEvent)) {
                             return chain.proceed();
                         }
                         MotionEvent ev = (MotionEvent) a0;
+                        View eventRoot = (View) self;
+                        // A theme change can install a new InputView without
+                        // firing either anchor. Adopt it from the touch stream.
+                        if (eventRoot != sRoot) {
+                            sRoot = eventRoot;
+                            installPreDrawWatcher(eventRoot);
+                            Log.i(TAG, "adopted InputView from touch");
+                        }
+                        if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                            evaluate(eventRoot);   // self-heal colour/overlay
+                        }
                         Rect hit = sHit;
                         View enter = sEnter;
                         if (hit == null || enter == null) {
@@ -538,6 +551,7 @@ public final class HookMain extends XposedModule {
         }
         // Idempotent: never leave a stale overlay from a previous root behind.
         cleanup();
+        installPreDrawWatcher(root);
         int row = shift.getHeight();
         int origH = enter.getHeight();
         int[] e = location(enter);
