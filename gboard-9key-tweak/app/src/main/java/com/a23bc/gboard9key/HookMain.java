@@ -58,6 +58,7 @@ public final class HookMain extends XposedModule {
     private static final String ID_SHIFT = "key_pos_shift";
     private static final String ID_ENTER = "key_pos_ime_action";
     private static final String ID_9KEY_1 = "key_pos_9key_1";
+    private static final String ID_HEADER_KEY = "key_pos_header_power_key";
 
     private static final boolean DUMP_TREE = true;
     private static final int MAX_NODES = 1500;
@@ -464,12 +465,20 @@ public final class HookMain extends XposedModule {
                         }
                         MotionEvent ev = (MotionEvent) a0;
                         // Hooks are installed along the class chain, so self can
-                        // be ANY child ViewGroup. Only the current InputView is
-                        // ours; every other receiver is an ordinary key touch
-                        // and must pass through untouched. Root adoption after
-                        // a theme change is handled exclusively by the watcher.
+                        // be ANY child ViewGroup. Ordinary key taps must pass
+                        // through untouched and must NEVER mutate sRoot.
                         if (self != sRoot) {
-                            return chain.proceed();
+                            if (ev.getActionMasked() == MotionEvent.ACTION_DOWN
+                                    && findKeyById((View) self, ID_9KEY_1) != null
+                                    && findKeyById((View) self, ID_ENTER) != null
+                                    && findKeyById((View) self, ID_HEADER_KEY) != null) {
+                                // A FULL InputView (toolbar + 9-key grid +
+                                // enter) appeared after a theme rebuild.
+                                sRoot = (View) self;
+                                installPreDrawWatcher(sRoot);
+                                Log.i(TAG, "adopted full InputView from touch");
+                            }
+                            return chain.proceed();   // never consume this event
                         }
                         Rect hit = sHit;
                         View enter = sEnter;
