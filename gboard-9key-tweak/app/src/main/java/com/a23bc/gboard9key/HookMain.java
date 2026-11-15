@@ -337,7 +337,9 @@ public final class HookMain extends XposedModule {
             return false;
         }
         sLastColourCheckMs = now;
-        View probe = sColourProbe;
+        // Never reuse a cached View: a theme flip can replace the key objects
+        // while keeping the InputView, leaving the old probe detached.
+        View probe = findKeyById(root, ID_SHIFT);
         if (probe == null) {
             return false;
         }
