@@ -16,6 +16,7 @@ import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.view.inputmethod.EditorInfo;
 import android.widget.ImageView;
 import android.widget.TextView;
@@ -85,6 +86,8 @@ public final class HookMain extends XposedModule {
     private static volatile int sLongPressMs = 300;   // Gboard default
     private static volatile Rect sShiftRect;   // screen coords, never steal it
     private static volatile View sWatchedRoot;
+    private static volatile ViewTreeObserver.OnPreDrawListener sPreDrawListener = null;
+    private static volatile int sNon9KeyFrames = 0;   // debounce layout churn
     private static volatile View sBigKey;
     private static volatile View sHiddenEnter;
     private static volatile View sHiddenKeyA;
@@ -184,27 +187,65 @@ public final class HookMain extends XposedModule {
         evaluate(root);
     }
 
-    /** Layout switches re-draw the same InputView; re-evaluate every frame. */
+    /**
+     * A theme change recreates the InputView. If the old root keeps its
+     * OnPreDrawListener, two watchers evaluate two different roots against a
+     * single global sApplied and flip cleanup/apply every frame. Always detach
+     * the previous listener first.
+     */
     private void installPreDrawWatcher(View root) {
         if (sWatchedRoot == root) {
             return;
         }
+        ViewTreeObserver.OnPreDrawListener old = sPreDrawListener;
+        View oldRoot = sWatchedRoot;
+        if (old != null && oldRoot != null) {
+            try {
+                ViewTreeObserver vto = oldRoot.getViewTreeObserver();
+                if (vto.isAlive()) {
+                    vto.removeOnPreDrawListener(old);
+                }
+            } catch (Throwable ignored) {
+                // old root already detached
+            }
+        }
         sWatchedRoot = root;
-        root.getViewTreeObserver().addOnPreDrawListener(() -> {
+        ViewTreeObserver.OnPreDrawListener listener = () -> {
             try {
                 evaluate(root);
             } catch (Throwable t) {
                 Log.w(TAG, "predraw evaluate failed", t);
             }
             return true;
-        });
-        Log.i(TAG, "predraw watcher installed");
+        };
+        sPreDrawListener = listener;
+        root.getViewTreeObserver().addOnPreDrawListener(listener);
+        Log.i(TAG, "predraw watcher installed (old detached)");
     }
 
     private static void evaluate(View root) {
+        // Ignore stale watchers from a destroyed InputView.
+        if (root != sRoot) {
+            return;
+        }
         boolean is9Key = findKeyById(root, ID_9KEY_1) != null
                 && findKeyById(root, ID_ENTER) != null;
-        if (is9Key && sApplied) {
+        if (!is9Key) {
+            if (!sApplied) {
+                return;
+            }
+            // Mid-relayout frames can briefly lose the 9-key ids; require a
+            // few consecutive frames before tearing everything down.
+            if (++sNon9KeyFrames < 3) {
+                return;
+            }
+            sNon9KeyFrames = 0;
+            cleanup();
+            Log.i(TAG, "left 9-key layout: merged key removed, enter restored");
+            return;
+        }
+        sNon9KeyFrames = 0;
+        if (sApplied) {
             // performClick() makes Gboard refresh the keyboard and reset key
             // visibility/alpha; re-assert our state every frame.
             View k = sHiddenKeyA;
@@ -215,14 +256,6 @@ public final class HookMain extends XposedModule {
             if (e != null && e.getAlpha() != 0f) {
                 e.setAlpha(0f);
             }
-            return;
-        }
-        if (is9Key == sApplied) {
-            return;
-        }
-        if (!is9Key) {
-            cleanup();
-            Log.i(TAG, "left 9-key layout: merged key removed, enter restored");
             return;
         }
         View keyA = findKeyById(root, ID_KEY_A);
@@ -266,6 +299,7 @@ public final class HookMain extends XposedModule {
         sPressed = false;
         sShiftRect = null;
         sDownInMerged = false;
+        sNon9KeyFrames = 0;
         sApplied = false;
     }
 
@@ -447,6 +481,8 @@ public final class HookMain extends XposedModule {
         if (rightCol == null) {
             return;
         }
+        // Idempotent: never leave a stale overlay from a previous root behind.
+        cleanup();
         int row = shift.getHeight();
         int origH = enter.getHeight();
         int[] e = location(enter);
